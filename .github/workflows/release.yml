@@ -25,11 +25,9 @@
 #   that failed mid-chain can be re-run as-is after fixing the config.
 #   npm publishing lives here rather than a separate `on: release: published` workflow: the Release is created
 #   by this workflow's GITHUB_TOKEN, and GitHub won't trigger other workflows' release events from that.
-name: Release
+name: Release (fork simulation)
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -274,6 +272,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          prerelease: true
+          make_latest: false
           body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: ${{ steps.notes.outputs.generate }}
           files: |
@@ -286,6 +286,8 @@ jobs:
 
   publish-npm:
     name: Publish npm packages
+    # Fork simulation safety guard: never publish PrismShadow packages from a fork.
+    if: github.repository == 'Prism-Shadow/penguin-harness'
     runs-on: ubuntu-latest
     # OIDC trusted publishing (same as AgentHub's publish.yml): no token; npmjs establishes trust via
     # environment `npm` + this workflow. A publish failure doesn't affect the release job (independent, parallel).
