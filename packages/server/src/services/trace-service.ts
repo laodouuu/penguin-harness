@@ -281,6 +281,8 @@ export class TraceService {
     // request that resumes after compaction starts yet another Task.
     let taskIndex = -1;
     let continuation = false; // The previous round's Request called a tool -> the next request_begin continues the same Task
+    /** Inside the image run that follows a `[user_steering]` text (see the turn-start rule below). */
+    let steeringImages = false;
     let sawToolCallThisRequest = false;
     // Compaction interval (compaction_begin..compaction_end): the compaction
     // request's request_begin/request_end and token_usage all fall inside it (see
@@ -360,10 +362,22 @@ export class TraceService {
         typeof p.text === "string" &&
         parseUserSteeringText(p.text) !== null;
       if (isSteeringText) continuation = true;
+      // Images sent with a steering message ride immediately behind its text, exactly as a
+      // Prompt's images ride behind theirs — and they inherit its exclusion: still the same
+      // Task, so `steeringImages` keeps the window open across the whole run of them and
+      // anything else on the main session closes it (an images-only Prompt after a steering
+      // message is a genuine new turn). A subagent's messages pass through without closing it:
+      // they belong to another session's stream and say nothing about this one's grouping.
+      // The Web answers the same "what is one Task" question over the live stream — see
+      // `openSteering` in web/src/lib/omni/stream-model.ts; the two need to stay in step.
+      const isImage = !hasOrigin && msg.type === "model_msg" && p.type === "image_url";
+      if (!hasOrigin && !isSteeringText && !(isImage && steeringImages)) steeringImages = false;
+      if (isSteeringText) steeringImages = true;
       const startsUserTurn =
         !hasOrigin &&
         !compactionActive &&
         !isSteeringText &&
+        !steeringImages &&
         msg.type === "model_msg" &&
         ((p.type === "text" && p.role === "user") || p.type === "image_url");
       const startsCompactionTurn =
@@ -372,7 +386,7 @@ export class TraceService {
         if (pendingFrom === null) pendingFrom = mi;
         // A user Prompt **always starts a new turn**: judging continuation solely
         // by "did the previous turn call a tool" isn't enough — if the previous
-        // turn ended in timeout/malformed (given up after exhausting retries),
+        // turn ended in a retryable status (given up after exhausting retries),
         // retryable would leave continuation at true, and this new message would
         // get merged into that failed turn, smearing the two turns' messages /
         // Tokens / TPS / duration together.
@@ -437,11 +451,21 @@ export class TraceService {
           }
         } else if (p.type === "request_end") {
           const status = typeof p.status === "string" ? p.status : undefined;
-          // timeout/malformed is automatically reconnected by core within the same
-          // run (context-engine's retry loop); the resent Request still belongs to
-          // **the same user turn**: it must continue the turn, otherwise a single
-          // timeout would split that turn's Tokens/duration/TPS across two Tasks.
-          const retryable = status === "timeout" || status === "malformed";
+          // A status core reconnects on within the same run (context-engine's retry
+          // loop) leaves the resent Request in **the same user turn**: it must
+          // continue the turn, otherwise a single blip would split that turn's
+          // Tokens/duration/TPS across two Tasks and inflate the Task count.
+          //
+          // This list must track the engine's, and the engine's differs by loop:
+          // the turn loop retries `failed` too, while compaction deliberately fails
+          // fast and stops on it (core's TURN_RETRY_STATUSES vs
+          // COMPACTION_RETRY_STATUSES). Hence the compactionActive guard — a failed
+          // compaction request really is the end of that request, and counting it
+          // as a reconnect would invent an attempt that never happened.
+          const retryable =
+            status === "timeout" ||
+            status === "malformed" ||
+            (status === "failed" && !compactionActive);
           if (!hasOrigin) {
             prevSerialTs = null;
             continuation = sawToolCallThisRequest || retryable;

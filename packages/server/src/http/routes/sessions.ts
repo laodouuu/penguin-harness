@@ -46,6 +46,13 @@ import {
 } from "../validate.js";
 import type { AppDeps } from "../../app.js";
 import { MAX_UPLOAD_BYTES } from "../../services/workspace-files-service.js";
+import {
+  assertAttachmentBudget,
+  attachFilesToInput,
+  parseAttachmentPart,
+  removeAttachments,
+} from "../../services/task-attachments.js";
+import type { TaskAttachment } from "../../services/task-attachments.js";
 
 /** Max title length for manual renames: looser than the auto-generated 30-char limit, to accommodate users' own organizing conventions. */
 const SESSION_TITLE_MAX = 120;
@@ -72,13 +79,78 @@ const SESSION_CATEGORIES: readonly SessionCategory[] = [
   "archived",
 ];
 
-/** Validate Prompt input parts: text or image (data: / http(s) URL). */
-function parseTaskInput(body: Record<string, unknown>): OmniMessage[] {
+/**
+ * A base64 `data:` URL of an image, in the exact shape core parses it back out of
+ * (`imagesToScratchpadPaths`): one mime type, the `;base64,` marker, a non-empty base64 body.
+ * The mime is deliberately unconstrained — core maps the ones it knows to a file extension and
+ * falls back to `.bin`, and the image tools sniff the magic bytes rather than trusting either.
+ *
+ * Checking the body, not just the `data:` prefix, is what keeps the failure here instead of
+ * three layers down: core turns a data URL it cannot parse into an "[an attached image could
+ * not be saved and was dropped]" line, which for an HTTP caller means a 202 followed by a
+ * message quietly missing its picture. The file-attachment field has always validated its own
+ * payload this way (parseAttachmentPart); this is the same rule for images.
+ */
+const IMAGE_DATA_URL = /^data:[^;,]+;base64,[A-Za-z0-9+/=\s]+$/;
+
+/**
+ * The image-URL rule every image-carrying request field obeys: a `data:` URL the session
+ * keeps (inline, or written to the scratchpad without vision) or an http(s) URL it references.
+ * `field` names the offending value in the error, so each caller reads as if it validated
+ * inline.
+ */
+function requireImageUrl(url: unknown, field: string): string {
+  if (typeof url === "string") {
+    if (url.startsWith("http://") || url.startsWith("https://")) return url;
+    if (IMAGE_DATA_URL.test(url)) return url;
+  }
+  throw badRequest(
+    `${field} must be an http(s) URL or a base64 data: URL (data:<mime>;base64,<bytes>).`,
+  );
+}
+
+/**
+ * Resolve a scratchpad file name to an absolute path inside `dir`, or null when it could point
+ * anywhere else (the caller turns that into the same 404 a missing file gets, so a probe learns
+ * nothing either way).
+ *
+ * A character whitelist is deliberately NOT the guard: an attachment keeps the name the user
+ * gave it, `报告.pdf` included, so the check is structural instead — no separators, no control
+ * characters, not a relative marker — and then *confirmed* by resolving the path and requiring
+ * its parent to be this session's directory exactly. That last step is what actually contains
+ * the read: it also rejects the shapes a character class misses, such as a Windows
+ * drive-relative `C:evil.png`.
+ */
+function resolveScratchpadFile(dir: string, fileName: string): string | null {
+  if (!fileName || fileName === "." || fileName === "..") return null;
+  for (const ch of fileName) {
+    const code = ch.codePointAt(0)!;
+    if (code < 0x20 || code === 0x7f || ch === "/" || ch === "\\") return null;
+  }
+  const resolved = path.resolve(dir, fileName);
+  return path.dirname(resolved) === path.resolve(dir) ? resolved : null;
+}
+
+/**
+ * A validated Prompt: the message parts that go straight into the run, plus the file
+ * attachments, which still have to be written to disk (see attachFilesToInput). Kept apart
+ * because validation stays synchronous and side-effect free — nothing touches the filesystem
+ * until the request is known to be good, and goal mode can reject files before any bytes land.
+ */
+interface ParsedTaskInput {
+  messages: OmniMessage[];
+  attachments: TaskAttachment[];
+}
+
+/** Validate Prompt input parts: text, image (data: / http(s) URL), or an uploaded file. */
+function parseTaskInput(body: Record<string, unknown>): ParsedTaskInput {
   const input = body.input;
   if (!Array.isArray(input) || input.length === 0) {
     throw badRequest("input must be an array with at least one item.");
   }
-  return input.map((item, i) => {
+  const messages: OmniMessage[] = [];
+  const attachments: TaskAttachment[] = [];
+  input.forEach((item, i) => {
     if (item === null || typeof item !== "object" || Array.isArray(item)) {
       throw badRequest(`input[${i}] must be an object.`);
     }
@@ -87,20 +159,56 @@ function parseTaskInput(body: Record<string, unknown>): OmniMessage[] {
       if (typeof part.text !== "string" || part.text.length === 0) {
         throw badRequest(`input[${i}].text must be a non-empty string.`);
       }
-      return userText(part.text);
+      messages.push(userText(part.text));
+      return;
     }
     if (part.type === "image_url") {
-      const url = part.imageUrl;
-      if (
-        typeof url !== "string" ||
-        !(url.startsWith("data:") || url.startsWith("http://") || url.startsWith("https://"))
-      ) {
-        throw badRequest(`input[${i}].imageUrl only supports data: or http(s) URLs.`);
-      }
-      return imageUrlMessage(url);
+      messages.push(imageUrlMessage(requireImageUrl(part.imageUrl, `input[${i}].imageUrl`)));
+      return;
     }
-    throw badRequest(`input[${i}].type must be one of text / image_url.`);
+    if (part.type === "file") {
+      // Not an OmniMessage of its own: the file becomes an `[attached file: …]` line on the
+      // text message once written to the scratchpad, so it carries no payload into the run.
+      attachments.push(parseAttachmentPart(part, i));
+      // Per-request count / total-bytes caps, re-checked on every part so a hostile `input`
+      // is cut off at the item that crosses the line (see assertAttachmentBudget).
+      assertAttachmentBudget(attachments);
+      return;
+    }
+    throw badRequest(`input[${i}].type must be one of text / image_url / file.`);
   });
+  return { messages, attachments };
+}
+
+/**
+ * Validate the optional `images` field of a steer request: a list of `data:` / http(s) URLs
+ * (same rule as a task input's `imageUrl`), absent or empty = a text-only steering message.
+ */
+function parseSteerImages(body: Record<string, unknown>): string[] {
+  const images = body.images;
+  if (images === undefined) return [];
+  if (!Array.isArray(images)) throw badRequest("images must be an array.");
+  return images.map((url, i) => requireImageUrl(url, `images[${i}]`));
+}
+
+/**
+ * Validate the optional `files` field of a steer request: the same shape and caps as a task
+ * input's `{type:"file"}` parts (parseAttachmentPart, budget re-checked per item), absent or
+ * empty = no attachments.
+ */
+function parseSteerFiles(body: Record<string, unknown>): TaskAttachment[] {
+  const files = body.files;
+  if (files === undefined) return [];
+  if (!Array.isArray(files)) throw badRequest("files must be an array.");
+  const attachments: TaskAttachment[] = [];
+  files.forEach((item, i) => {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) {
+      throw badRequest(`files[${i}] must be an object.`);
+    }
+    attachments.push(parseAttachmentPart(item as Record<string, unknown>, i, "files"));
+    assertAttachmentBudget(attachments);
+  });
+  return attachments;
 }
 
 /**
@@ -129,6 +237,8 @@ function parseGoalField(body: Record<string, unknown>): { budget: number } | nul
 export function agentSessionsRoutes(deps: AppDeps): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
 
+  // `cli=1` widens the list to CLI-created Sessions (Trace-directory discovery + adoption);
+  // the default serves web rows straight from the DB (see SessionService.listSessions).
   app.get("/", async (c) => {
     // Id validity is checked before any path is constructed (FD-4: guards against agentId path traversal across Projects).
     const projectId = requireValidId(c, "projectId");
@@ -146,6 +256,8 @@ export function agentSessionsRoutes(deps: AppDeps): Hono<AppEnv> {
     }
     const rawCounts = c.req.query("counts");
     if (rawCounts !== undefined && rawCounts !== "1") throw badRequest("counts only accepts 1.");
+    const rawCli = c.req.query("cli");
+    if (rawCli !== undefined && rawCli !== "1") throw badRequest("cli only accepts 1.");
     const { sessions, counts, workspaceCounts } = await deps.sessionService.listSessions(
       projectId,
       agentId,
@@ -153,6 +265,7 @@ export function agentSessionsRoutes(deps: AppDeps): Hono<AppEnv> {
         ...(paging ? { paging } : {}),
         ...(rawCategory !== undefined ? { category: rawCategory as SessionCategory } : {}),
         ...(rawCounts !== undefined ? { withCounts: true } : {}),
+        ...(rawCli !== undefined ? { includeCli: true } : {}),
       },
     );
     return c.json({
@@ -323,29 +436,33 @@ export function sessionsRoutes(deps: AppDeps): Hono<AppEnv> {
     return c.body(null, 204);
   });
 
-  // Session scratchpad files (e.g. input images saved to disk for image-unsupported
-  // models): read by filename, so the conversation UI can render a message's
-  // "[attached image: <path>]" attachment line back into an image. Restricted to this
-  // session's own scratchpad directory (the filename must not contain a path
-  // separator, blocking traversal); filenames include a timestamp and are globally
-  // unique, so the response is marked immutable and long-cacheable.
+  // Session scratchpad files (input images saved to disk for image-unsupported models, the
+  // composer's file attachments, model-generated temp files): read by filename, so the
+  // conversation UI can render a message's "[attached image: <path>]" attachment line back
+  // into an image. Restricted to this session's own scratchpad directory (see
+  // resolveScratchpadFile); a name is never reused for different bytes — uploads take a random
+  // suffix on collision — so the response is marked immutable and long-cacheable.
   app.get("/:sessionId/scratchpad/:fileName", async (c) => {
     const row = resolveSession(c);
     const fileName = c.req.param("fileName") ?? "";
-    if (!/^[A-Za-z0-9._-]+$/.test(fileName) || fileName.includes("..")) {
-      throw new HttpError(404, "file_not_found", "File does not exist.");
-    }
-    const filePath = path.join(
-      scratchpadDir(deps.config.root, row.projectId, row.agentId),
-      row.sessionId,
+    const filePath = resolveScratchpadFile(
+      path.join(scratchpadDir(deps.config.root, row.projectId, row.agentId), row.sessionId),
       fileName,
     );
+    if (!filePath) throw new HttpError(404, "file_not_found", "File does not exist.");
     let bytes: Buffer;
     try {
       bytes = await fs.readFile(filePath);
     } catch {
       throw new HttpError(404, "file_not_found", "File does not exist.");
     }
+    // SECURITY BOUNDARY — do not extend casually. This map is an allowlist of types that are
+    // safe to hand a browser inline from the App's own origin, and it is the only reason the
+    // bytes below (arbitrary user uploads and Agent-written temp files) cannot become stored
+    // XSS. Every image type here is inert when rendered. Adding `.svg`, `.html`, `.pdf` or
+    // anything else that a browser parses as a document would look like a one-line convenience
+    // and would immediately be same-origin script execution — such a type needs the treatment
+    // the Workspace read gives it (plain-text downgrade or a sandbox CSP), not a map entry.
     const MIME_BY_EXT: Record<string, string> = {
       ".png": "image/png",
       ".jpg": "image/jpeg",
@@ -353,9 +470,23 @@ export function sessionsRoutes(deps: AppDeps): Hono<AppEnv> {
       ".gif": "image/gif",
       ".webp": "image/webp",
     };
-    const mime = MIME_BY_EXT[path.extname(fileName).toLowerCase()] ?? "application/octet-stream";
+    const mime = MIME_BY_EXT[path.extname(fileName).toLowerCase()];
     return c.body(new Uint8Array(bytes), 200, {
-      "content-type": mime,
+      "content-type": mime ?? "application/octet-stream",
+      // nosniff: the composer's file attachments land in this same directory, so the bytes
+      // here are arbitrary user content served from the App's own origin — without it a
+      // browser could sniff an `application/octet-stream` upload back into HTML and run it
+      // same-origin (the same defense workspace file reads apply).
+      "x-content-type-options": "nosniff",
+      // Second, independent layer for everything that fell off the allowlist: the only reason
+      // this endpoint is fetched inline is the conversation's <img> tags, so anything that is
+      // not one of those images is served as a download and never renders as a document —
+      // nosniff alone would be the whole defense otherwise.
+      ...(mime === undefined
+        ? {
+            "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+          }
+        : {}),
       "cache-control": "private, max-age=31536000, immutable",
     });
   });
@@ -395,11 +526,15 @@ export function sessionsRoutes(deps: AppDeps): Hono<AppEnv> {
     // this as authoritative, eliminating input-area lockup or premature Task closure
     // caused by a stale running/idle in the list; followed by replaying all still-pending
     // approval requests.
+    const pendingSteering = deps.manager.pendingSteeringOf(row.sessionId);
     const initialEvents: ServerEvent[] = [
       {
         type: "task_state",
         state: deps.manager.statusOf(row.sessionId),
         queued: deps.manager.pendingFollowUpCount(row.sessionId),
+        // Undelivered steering rides the snapshot too, so the composer's "steering queued"
+        // hint (and what it says) survives a reload.
+        ...(pendingSteering.length > 0 ? { pendingSteering } : {}),
       },
       ...deps.manager.pendingApprovals(row.sessionId).map((p) => ({
         type: "approval_request" as const,
@@ -419,46 +554,107 @@ export function sessionsRoutes(deps: AppDeps): Hono<AppEnv> {
     // follow-up keeps its level for its auto-start.
     const thinkingLevel = optionalEnum(body, "thinkingLevel", THINKING_LEVELS);
     if (goal) {
-      // Goal mode: the input must be plain non-empty text (its marker-stripped text becomes
-      // the objective, re-injected every round — images have no place in the protocol).
-      const input = parseTaskInput(body);
-      const text = input
+      // Goal mode: the input needs non-empty text, since its marker-stripped text becomes the
+      // objective that every round re-injects and an image on its own doesn't say what the
+      // goal is. Images can come along — core folds them into `[attached image: <path>]` lines
+      // inside the objective (whatever the model's vision) so they survive the rounds. File
+      // attachments cannot: nothing folds them into the objective, so they are turned away
+      // here, before any upload is written to disk.
+      const { messages, attachments } = parseTaskInput(body);
+      const text = messages
         .filter((m) => (m.payload as { type?: string }).type === "text")
         .map((m) => (m.payload as { text: string }).text)
         .join("\n")
         .trim();
-      if (!text || input.some((m) => (m.payload as { type?: string }).type !== "text")) {
-        throw badRequest("goal mode requires text-only input (the objective).");
+      if (!text) {
+        throw badRequest("goal mode requires a non-empty text objective.");
+      }
+      if (attachments.length > 0) {
+        throw badRequest("goal mode accepts text and images only (no file attachments).");
       }
       const { sessionId } = await deps.manager.startGoal(row.sessionId, {
-        input,
+        input: messages,
         budget: goal.budget,
         ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
       });
       return c.json({ sessionId } satisfies TaskCreateResponse, 202);
     }
-    const input = parseTaskInput(body);
+    const parsed = parseTaskInput(body);
     // Follow-up queue: with queueIfBusy, a busy session enqueues the input instead of 409
     // (auto-starts as an ordinary next task once idle; the response says which happened).
     const queueIfBusy = body.queueIfBusy === true;
-    // 202: the Task executes on the server, decoupled from the SSE connection; sessionId is the current actual id (the new id after self-heal).
-    const { sessionId, queued } = await deps.manager.startTask(row.sessionId, input, {
-      ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
-      queueIfBusy,
-    });
-    return c.json({ sessionId, queued } satisfies TaskCreateResponse, 202);
+    // Advisory pre-check, so the overwhelmingly common rejection — sending while a Task is
+    // running, without queueIfBusy — never writes bytes it would then have to take back. The
+    // authoritative check still runs under the Session lock inside startTask; this one is
+    // lock-free and may pass on a race, which the cleanup below covers.
+    deps.manager.assertCanAcceptTask(row.sessionId, { queueIfBusy });
+    // File attachments land in this Session's scratchpad (deleted along with the Session) and
+    // are handed to the model as `[attached file: <path>]` lines on the message text. Written
+    // even when the task ends up queued as a follow-up: the queued input must be complete, and
+    // the queue is drained by this same Session. A Trace-less Session that self-heals into a
+    // new id below keeps its files under the id they were written with — the paths in the
+    // message stay valid; only the delete-with-the-Session cleanup misses them in that case.
+    const { input, written } = await attachFilesToInput(
+      parsed.messages,
+      parsed.attachments,
+      scratchpadDir(deps.config.root, row.projectId, row.agentId),
+      row.sessionId,
+    );
+    try {
+      // 202: the Task executes on the server, decoupled from the SSE connection; sessionId is the current actual id (the new id after self-heal).
+      const { sessionId, queued } = await deps.manager.startTask(row.sessionId, input, {
+        ...(thinkingLevel !== undefined ? { thinkingLevel } : {}),
+        queueIfBusy,
+      });
+      return c.json({ sessionId, queued } satisfies TaskCreateResponse, 202);
+    } catch (err) {
+      // The Task never started, so nothing references these files and nothing will ever clean
+      // them up — and the Web keeps the chips on failure, so the user's retry would otherwise
+      // land a second copy of every one of them.
+      await removeAttachments(written);
+      throw err;
+    }
   });
 
   // Mid-run steering: queue a user message for the running Task; core delivers it between
-  // turns as a standalone `[user_steering]` user message (the model sees it without the loop
-  // being interrupted). 409 not_running when no Task is in progress — the frontend then falls
-  // back to a normal task POST.
+  // turns as a standalone `[user_steering]` user message, with any images following it as
+  // user image messages (the model sees the whole thing without the loop being interrupted).
+  // 409 not_running when no Task is in progress — the frontend then falls back to a normal
+  // task POST.
   app.post("/:sessionId/steer", async (c) => {
     const row = resolveSession(c);
     const body = await readJson(c);
     const text = typeof body.text === "string" ? body.text.trim() : "";
-    if (!text) throw badRequest("text must be a non-empty string.");
-    deps.manager.steer(row.sessionId, text);
+    const images = parseSteerImages(body);
+    const files = parseSteerFiles(body);
+    // Any part can carry the message on its own: an image or a file with no caption is a
+    // complete steering message, and so is plain text.
+    if (!text && images.length === 0 && files.length === 0) {
+      throw badRequest("text, images or files must carry the steering message.");
+    }
+    // The wire shape becomes core's: a user text message (omitted when the images are the
+    // whole message, so the fold's path lines aren't preceded by a blank one) plus one image
+    // message each — the same input a normal task would carry. File attachments land in the
+    // Session scratchpad exactly as a task's do and ride as `[attached file: <path>]` lines
+    // on the steering text (a files-only input becomes a line-only text message).
+    const { input, written } = await attachFilesToInput(
+      [...(text ? [userText(text)] : []), ...images.map((url) => imageUrlMessage(url))],
+      files,
+      scratchpadDir(deps.config.root, row.projectId, row.agentId),
+      row.sessionId,
+    );
+    try {
+      deps.manager.steer(row.sessionId, input, {
+        text,
+        images: images.length,
+        files: files.length,
+      });
+    } catch (err) {
+      // 409 (not running) or any other refusal: the files must not stay behind — the
+      // frontend falls back to a normal task POST, which writes its own copies.
+      await removeAttachments(written);
+      throw err;
+    }
     return c.body(null, 202);
   });
 

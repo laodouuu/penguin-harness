@@ -20,6 +20,8 @@ The CLI and the server automatically load a `.env` file from the working directo
 | `PENGUIN_LANG` | CLI language (`en` / `zh`), set via `penguin config lang` | `en` |
 | `PENGUIN_UPDATE_CHECK` | `off` disables the web app's new-release check (the server's only outbound internet call) | enabled |
 
+These configure PenguinHarness itself, so `PORT`, `HOST`, `PENGUIN_WEB_DIST` and the internal `PENGUIN_CLI_ENTRY` are **removed from the environment of commands the Agent runs** — otherwise a dev server started by `exec_command` would read `PORT` and try to bind the port meant for PenguinHarness instead of choosing its own. The rest of the host environment passes through, with one further exception: `GIT_EDITOR`, `GIT_TERMINAL_PROMPT`, `TERM`, `NO_COLOR`, `PAGER` and `GIT_PAGER` are always forced to fixed values, so that a command cannot hang waiting on an editor, a credential prompt or a pager. The Agent's [vault](#vault) is applied on top of the host environment — setting `PORT` there does reach commands — but not on top of those six.
+
 `PENGUIN_PREVIEW_ORIGIN` must differ from the app's origin by **hostname**, not just port: cookies ignore ports, so a second port would still share the session cookie. Leave it unset for local use — the app is canonicalized onto `localhost` and previews are served from `127.0.0.1`, which needs no configuration and no DNS. Set it when the app is reached over a LAN address or a real domain; otherwise previews there fall back to a same-origin sandbox where `localStorage`, cookies and third-party embeds do not work. When you do set it on a real domain, keep the session cookie host-only (no `Domain=`), or a sibling subdomain shares it. An unparseable value is a startup error rather than a silent fallback.
 
 ### Provider credential variables
@@ -30,12 +32,12 @@ When a model entry has no inline `api_key`, the AgentHub gateway falls back to t
 | --- | --- | --- |
 | deepseek | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` |
 | anthropic | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` |
-| openai, openrouter, siliconflow, custom | `OPENAI_API_KEY` | `OPENAI_BASE_URL` |
+| openai, openrouter, fireworks, siliconflow, qwen-token-plan, qwen-pay-as-you-go, custom | `OPENAI_API_KEY` | `OPENAI_BASE_URL` |
 | google | `GEMINI_API_KEY` | `GEMINI_BASE_URL` |
 | zhipu | `ZAI_API_KEY` | `ZAI_BASE_URL` |
 | moonshot | `MOONSHOT_API_KEY` | `MOONSHOT_BASE_URL` |
 
-The openrouter, siliconflow, and custom groups speak the OpenAI-compatible protocol, hence the shared `OPENAI_*` variables. Provider groups and the built-in model catalog are covered in [Models & Providers](/models).
+The openrouter, fireworks, siliconflow, qwen-token-plan, qwen-pay-as-you-go, and custom groups speak the OpenAI-compatible protocol, hence the shared `OPENAI_*` variables. Provider groups and the built-in model catalog are covered in [Models & Providers](/models).
 
 ## Project config
 
@@ -58,6 +60,7 @@ Model entry (`[[models]]`) fields:
 | `client_type` | AgentHub client protocol; inferred from `model_id` by default — third-party OpenAI-compatible models should set `openai` |
 | `display_name` | Display name; persisted only when it differs from the built-in catalog |
 | `vision` | Whether image input is supported; defaults to supported |
+| `max_tokens` | Per-model max output tokens; overrides the Agent's `model.max_tokens` when set, omitted = inherit it |
 | `pricing` | Three price buckets `cache_read` / `cache_write` / `output`, in USD per million Tokens (`unit = "usd_per_mtok"`) |
 | `api_key` | Inline credential; when empty, falls back to the provider environment variable |
 | `base_url` | Custom base URL; preset for gateway models |
@@ -157,6 +160,8 @@ An existing Agent always runs with its on-disk config verbatim — newer code de
 | `{{SESSION_ID}}` | Session id |
 
 `{{PROJECT_DIR}}` is surfaced to the model as the **App Data Dir**: PenguinHarness's application data root, holding every Agent's data files (`agents/<agent_id>/…`) and the project-level data — deliberately not described as a project or task directory, so the model does not mistake it for the task's working directory (`CWD`).
+
+On Windows, `{{PROJECT_DIR}}` and `{{CWD}}` are injected with forward slashes — like every other path core composes for the model (attachment lines, the goal-file line, truncated-output recovery paths). The model re-emits these spellings into JSON tool arguments and shell commands; forward slashes are accepted by Node's fs APIs and the package's (Git) Bash tool shell, and avoid JSON backslash-escaping mistakes.
 
 `agent_state/AGENTS.md` is the developer-editable instruction file, injected via `{{AGENTS_MD}}` and empty by default — it is also the file an optimizer edits most (see [Self-Improvement](/self-improvement)).
 

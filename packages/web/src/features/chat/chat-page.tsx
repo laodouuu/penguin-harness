@@ -59,7 +59,7 @@ import { latestTaskHasSubagent, taskStartCount } from "./agent-topology";
 import { ChatInput } from "./chat-input";
 import { DraftView } from "./draft-view";
 import { GoalStatusBanner } from "./goal-banner";
-import { handoffMessage, modelSwitchMessage } from "./agent-mentions";
+import { handoffMessage, modelSwitchMessage } from "./agent-handoff";
 import { sameModelRef } from "../models/model-grouping";
 import { providerInfo } from "@prismshadow/penguin-core/model-catalog";
 import { FilesPanel } from "./files-panel";
@@ -215,6 +215,13 @@ function headerStats(
  */
 export const DRAFT_SESSION_ID = "new";
 
+/**
+ * Server-enforced ceiling on paths per files/stat call (STAT_MAX_PATHS in the sessions routes,
+ * which 400s above it). A Task-level summary aggregates candidates across the whole Task and can
+ * exceed it, so cache misses are checked in chunks of this size.
+ */
+const STAT_PATHS_PER_REQUEST = 100;
+
 export function ChatPage() {
   const navigate = useNavigate();
   const params = useParams<{ sessionId?: string }>();
@@ -287,11 +294,14 @@ export function ChatPage() {
     () => void reloadSessions(),
   );
 
-  // Chat input area draft: caches text, @ target, and selected skills keyed by sessionId; restored after navigating away and back or a refresh, discarded on successful send.
+  // Chat input area draft: caches text, both staged switch chips (`/agent` target, `/model`
+  // target) and the selected skills keyed by sessionId; restored after navigating away and back
+  // or a refresh, discarded on successful send.
   const {
     initial: sessionDraft,
     onTextChange: onDraftTextChange,
     onHandoffTargetChange: onDraftHandoffChange,
+    onPendingModelChange: onDraftPendingModelChange,
     onSkillsChange: onDraftSkillsChange,
     discard: discardSessionDraft,
   } = useSessionDraft(selected?.sessionId ?? null);
@@ -310,12 +320,23 @@ export function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSessionId, selectedAgentId, setCurrentAgentId]);
 
-  // TASK-SCOPED panel visibility (owner rule: an open panel belongs to the task it was opened
-  // for). The pure tracker (advancePanelTaskScope, unit-tested) decides at each observation:
-  //   - entering a session / a NEW Task starting (a user message — taskStartCount increase)
-  //     closes the panel by default, so an unrelated task never inherits it;
-  //   - the CURRENT task's first live spawn auto-opens it (re-armed per task; a manual close
-  //     afterwards is respected until the next boundary).
+  // A NEW chat starts with both panels closed: a panel opened for an earlier conversation must
+  // not carry into a freshly created one. The draft is the reset point — it renders no panels
+  // itself, so the Session created from it (first send navigates to /chat/:id) begins closed,
+  // while a plain conversation switch keeps whatever the user had open. This effect owns the
+  // ONLY automatic close of either panel.
+  useEffect(() => {
+    if (!draft) return;
+    filesPanelRaw.setOpen(false);
+    subagentsPanelRaw.setOpen(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft]);
+
+  // Subagents panel AUTO-OPEN (the one visibility rule this panel has beyond the Files panel's):
+  // the pure tracker (advancePanelTaskScope, unit-tested) opens it on the CURRENT task's first
+  // live spawn, re-armed at every task boundary so a manual close is respected until the next
+  // one. Boundaries themselves no longer close anything — an open panel now survives Session
+  // switches and new Tasks alike, matching the Files panel.
   // The auto-open applies only when docked (a mobile Sheet sliding over the conversation
   // uninvited would be worse than staying discoverable via the row), never over an open Files
   // panel (an automatic open must not steal an explicit one — the row and the toolbar's amber
@@ -330,9 +351,7 @@ export function ChatPage() {
       taskCount,
       liveSpawn,
     });
-    if (action === "close") {
-      subagentsPanelRaw.setOpen(false);
-    } else if (
+    if (
       action === "autoOpen" &&
       subagentsPanelRaw.isDocked &&
       !subagentsPanelRaw.open &&
@@ -439,10 +458,10 @@ export function ChatPage() {
     }
   }, [stream.taskState, reloadSessions, reloadAgents]);
 
-  // Existence cache for message file cards (session-level): normalized relative path -> whether
-  // it exists; while a lookup is in flight, the cache shares a single Promise, so a batch of
-  // concurrent mounts only issues one files/stat call.
-  const statCacheRef = useRef(new Map<string, boolean | Promise<boolean>>());
+  // Positive-only existence cache for file summary cards (session-level): normalized relative
+  // path -> true, or the shared in-flight lookup. Missing files aren't retained — a later Task may
+  // create the same path, so its summary must re-check instead of inheriting stale false state.
+  const statCacheRef = useRef(new Map<string, true | Promise<boolean>>());
 
   // Session switch: resets the cost, the file-card existence cache, and the per-turn thinking
   // level (it's per-session UI state), avoiding stale data from the previous Session (Files
@@ -454,34 +473,30 @@ export function ChatPage() {
     statCacheRef.current = new Map();
   }, [routeSessionId]);
 
-  // Batched existence check (message file cards): merges only the cache-miss paths into a single
-  // files/stat call, and the result lands in the session-level cache — during streaming, the
-  // candidate set is re-checked on every change, and the cache ensures only new paths trigger a
-  // request. On request failure, the placeholder is cleared (don't permanently cache a "couldn't
-  // find" as "doesn't exist"), returned as not-existing this time, and re-checked on the next mount.
+  // Batched existence check for file summaries: cache stable positive results and share in-flight
+  // requests, but never retain a negative result. Each pending lookup mutates the cache only while
+  // it is still the current entry, so an old request can't delete or overwrite a newer one.
   const statFiles = useCallback(
     async (paths: string[]): Promise<ReadonlySet<string>> => {
       const sessionId = selected?.sessionId ?? null;
       const cache = statCacheRef.current;
       const misses = sessionId === null ? [] : paths.filter((p) => !cache.has(p));
       if (sessionId !== null && misses.length > 0) {
-        const batch = api
-          .statSessionFiles(sessionId, misses)
-          .then((res) => new Set(res.existing))
-          .catch(() => null);
-        for (const p of misses) {
-          cache.set(
-            p,
-            batch.then((existing) => {
-              if (existing === null) {
-                cache.delete(p);
-                return false;
-              }
-              const exists = existing.has(p);
-              cache.set(p, exists);
-              return exists;
-            }),
-          );
+        for (let i = 0; i < misses.length; i += STAT_PATHS_PER_REQUEST) {
+          const chunk = misses.slice(i, i + STAT_PATHS_PER_REQUEST);
+          const batch = api
+            .statSessionFiles(sessionId, chunk)
+            .then((res) => new Set(res.existing))
+            .catch(() => null);
+          for (const p of chunk) {
+            const pending = batch.then((existing) => existing?.has(p) ?? false);
+            cache.set(p, pending);
+            void pending.then((exists) => {
+              if (cache.get(p) !== pending) return;
+              if (exists) cache.set(p, true);
+              else cache.delete(p);
+            });
+          }
         }
       }
       const result = new Set<string>();
@@ -636,10 +651,10 @@ export function ChatPage() {
     [projectId, selected, addSession, discardSessionDraft, navigate],
   );
 
-  // @ handoff: doesn't use the current Session — creates a new chat for the @-mentioned agent
+  // /agent handoff: doesn't use the current Session — creates a new chat for the picked agent
   // (approval mode carries over from the input area's current value; model/Workspace use the
   // creation defaults). The first input = a [handoff_from] source block (current agent / Session
-  // / Workspace info) + the user's input and images with the @ mention stripped; jumps to the new
+  // / Workspace info) + the user's input and images; jumps to the new
   // chat once sent.
   // Returns false on failure, keeping the draft so it can be resent (deletes the empty Session that never got its first message sent).
   const onHandoff = useCallback(
@@ -704,16 +719,29 @@ export function ChatPage() {
     [selected, discardSessionDraft, syncHealedSessionId],
   );
 
-  // Mid-run steering: the text is queued on the server and delivered between turns as a
-  // standalone `[user_steering]` user message (visible once it arrives over SSE / from the
-  // Trace). "not_running" (409) means no Task is in progress anymore (race with completion):
-  // the input area then falls back to its **full** normal send path — images / skills / the
-  // whole draft included — rather than a text-only task.
+  // Mid-run steering: the message is queued on the server and delivered between turns as a
+  // standalone `[user_steering]` user message followed by its images (visible once they
+  // arrive over SSE / from the Trace); file attachments land in the Session scratchpad and
+  // ride the steering text as `[attached file: <path>]` lines, exactly as a task's do. On
+  // "queued" the localStorage draft is discarded, like a successful send — without this a
+  // reload resurrects the already-sent text as a draft, and re-sending it duplicates the
+  // steering message (#136). "not_running" (409) means no Task is in progress anymore (race
+  // with completion): the input area then falls back to its **full** normal send path —
+  // skills and the whole draft included — rather than a text+images task.
   const onSteer = useCallback(
-    async (text: string): Promise<"queued" | "not_running" | "failed"> => {
+    async (
+      text: string,
+      images: string[] = [],
+      files: { fileName: string; dataUrl: string }[] = [],
+    ): Promise<"queued" | "not_running" | "failed"> => {
       if (!selected) return "failed";
       try {
-        await api.postSteer(selected.sessionId, { text });
+        await api.postSteer(selected.sessionId, {
+          text,
+          ...(images.length > 0 ? { images } : {}),
+          ...(files.length > 0 ? { files } : {}),
+        });
+        discardSessionDraft();
         return "queued";
       } catch (e) {
         if (e instanceof ApiError && e.status === 409) return "not_running";
@@ -721,7 +749,7 @@ export function ChatPage() {
         return "failed";
       }
     },
-    [selected],
+    [selected, discardSessionDraft],
   );
 
   const onApprove = useCallback(
@@ -866,6 +894,7 @@ export function ChatPage() {
       // Count of steering messages already visible in the stream: the input area keeps its
       // "queued" indicator up until this count increases (i.e. the steering message arrived).
       steeringDeliveredCount={stream.model.items.filter((i) => i.kind === "user_steering").length}
+      pendingSteering={stream.pendingSteering}
       onQueueFollowUp={onQueueFollowUp}
       queuedFollowUps={stream.queuedFollowUps}
       onStop={onStop}
@@ -887,6 +916,7 @@ export function ChatPage() {
       modeSaving={modeSaving}
       autoFocus
       agents={agents}
+      currentAgentId={selected.agentId}
       skills={agentSkills}
       {...(sessionDraft.skills && sessionDraft.skills.length > 0
         ? { initialSkills: sessionDraft.skills }
@@ -899,6 +929,10 @@ export function ChatPage() {
         ? { initialHandoffTargetId: sessionDraft.handoffAgentId }
         : {})}
       onHandoffTargetChange={onDraftHandoffChange}
+      {...(sessionDraft.switchModelRef
+        ? { initialPendingModelRef: sessionDraft.switchModelRef }
+        : {})}
+      onPendingModelChange={onDraftPendingModelChange}
     />
   );
 

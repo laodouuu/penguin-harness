@@ -1,33 +1,55 @@
 /**
- * Metric switching and per-model series grouping for the Benchmark center chart (pure functions,
- * easy to unit test): the chart can switch between the score / cost / duration metrics (sharing
- * the same time axis), and is grouped into series by each evaluation's (provider, modelId) — one
- * color per series, legend by model. score is always present;
- * cost / durationMs are optional — missing values are **skipped points**: neither drawn nor
- * connected, so the line breaks at the gap (lineSegments splits value-bearing indices into
- * contiguous segments).
+ * Score-only data helpers and per-runtime series grouping for the Benchmark center chart.
+ * Series share one time axis and use each Evaluation's authoritative stored Score.
  */
 
-export type BenchmarkMetric = "score" | "cost" | "duration";
-
-export const BENCHMARK_METRICS: readonly BenchmarkMetric[] = ["score", "cost", "duration"];
-
-/** Minimal evaluation shape needed to read a metric (BenchmarkEvaluation is a superset). */
+/** Minimal Evaluation shape needed to read Score (BenchmarkEvaluation is a superset). */
 export interface MetricSourceLike {
   score: number;
-  cost?: number;
-  durationMs?: number;
 }
 
-/** Each evaluation's value under the selected metric; missing (cost / durationMs not recorded) is null (skipped point). */
-export function metricValues(
-  evaluations: readonly MetricSourceLike[],
-  metric: BenchmarkMetric,
-): (number | null)[] {
+/** Each Evaluation's authoritative stored Score; non-finite malformed values become chart gaps. */
+export function scoreValues(evaluations: readonly MetricSourceLike[]): (number | null)[] {
   return evaluations.map((e) => {
-    const v = metric === "score" ? e.score : metric === "cost" ? e.cost : e.durationMs;
-    return typeof v === "number" && Number.isFinite(v) ? v : null;
+    return typeof e.score === "number" && Number.isFinite(e.score) ? e.score : null;
   });
+}
+
+export interface ScoreScale {
+  min: number;
+  max: number;
+  ticks: number[];
+}
+
+const SCORE_MIN = 0;
+const SCORE_MAX = 100;
+const SCORE_PADDING = 10;
+const SCORE_TICK_STEPS = [1, 2, 2.5, 5, 10, 20];
+
+/**
+ * Dynamic Score domain: pad the observed min/max by 10, clamp to the valid
+ * 0..100 Score interval, then round outward to human-friendly ticks.
+ */
+export function scoreScale(values: readonly (number | null)[]): ScoreScale {
+  const present = values.filter(
+    (value): value is number => value !== null && value >= SCORE_MIN && value <= SCORE_MAX,
+  );
+  if (present.length === 0) {
+    return { min: SCORE_MIN, max: SCORE_MAX, ticks: [0, 20, 40, 60, 80, 100] };
+  }
+
+  const observedMin = Math.min(...present);
+  const observedMax = Math.max(...present);
+  const paddedMin = Math.max(SCORE_MIN, observedMin - SCORE_PADDING);
+  const paddedMax = Math.min(SCORE_MAX, observedMax + SCORE_PADDING);
+  const step = SCORE_TICK_STEPS.find((candidate) => (paddedMax - paddedMin) / candidate <= 5)!;
+  const min = Math.max(SCORE_MIN, Math.floor(paddedMin / step) * step);
+  const max = Math.min(SCORE_MAX, Math.ceil(paddedMax / step) * step);
+  const ticks = Array.from(
+    { length: Math.round((max - min) / step) + 1 },
+    (_, index) => min + index * step,
+  );
+  return { min, max, ticks };
 }
 
 /** A single data point on the chart: original index (x-axis position) + value. */
@@ -56,44 +78,38 @@ export function lineSegments(values: readonly (number | null)[]): MetricPoint[][
   return segments;
 }
 
-/** Y-axis upper bound: the max of value-bearing points (falls back to a tiny positive number when all values are missing / zero, to avoid dividing by zero in the coordinate system). */
-export function metricMax(values: readonly (number | null)[]): number {
-  return Math.max(1e-9, ...values.filter((v): v is number => v !== null));
-}
-
 /** Minimal evaluation shape needed for series grouping (BenchmarkEvaluation is a superset). */
 export interface ModelRefLike {
-  provider?: string;
   modelId?: string;
+  thinkingLevel?: string;
 }
 
-/** One chart series: the set of evaluations sharing the same (provider, modelId) (older records with no model tag are grouped into a single series). */
+/** One chart series: the set of evaluations sharing the same (modelId, thinkingLevel). */
 export interface EvaluationSeries {
   /** Grouping key (internal grouping only, not used as an id; empty string for untagged model). */
   key: string;
-  provider?: string;
   modelId?: string;
+  thinkingLevel?: string;
   /** Matching evaluation indices: global time-axis positions, shared across all series on the same x-axis. */
   indices: number[];
 }
 
 /**
- * Groups evaluations into series by the model they carry: models are ordered by first
- * appearance (color is picked from SERIES_COLORS by series index, so color follows the model and
- * doesn't change with filtering); older records with no model tag are grouped into a trailing
- * unnamed series (shown in gray, labeled "untagged model").
+ * Groups evaluations into series by model ID and thinking level, deliberately ignoring provider.
+ * Runtime combinations are ordered by first appearance (color is picked from SERIES_COLORS by
+ * series index); defensive records with no model tag are grouped into a trailing unnamed series.
  */
 export function modelSeries(evaluations: readonly ModelRefLike[]): EvaluationSeries[] {
   const map = new Map<string, EvaluationSeries>();
   evaluations.forEach((e, index) => {
     const labeled = e.modelId !== undefined && e.modelId !== "";
-    const key = labeled ? `${e.provider ?? ""}\u0000${e.modelId}` : "";
+    const key = labeled ? `${e.modelId}\u0000${e.thinkingLevel ?? ""}` : "";
     let series = map.get(key);
     if (!series) {
       series = {
         key,
-        ...(labeled && e.provider !== undefined ? { provider: e.provider } : {}),
         ...(labeled && e.modelId !== undefined ? { modelId: e.modelId } : {}),
+        ...(labeled && e.thinkingLevel !== undefined ? { thinkingLevel: e.thinkingLevel } : {}),
         indices: [],
       };
       map.set(key, series);
@@ -104,12 +120,11 @@ export function modelSeries(evaluations: readonly ModelRefLike[]): EvaluationSer
   return [...all.filter((x) => x.key !== ""), ...all.filter((x) => x.key === "")];
 }
 
-/** A series' value sequence under the selected metric: indices outside this series are null (skipped point), keeping the global time axis. */
+/** A series' Score sequence; indices outside this series are null, keeping the global time axis. */
 export function seriesValues(
   evaluations: readonly (MetricSourceLike & ModelRefLike)[],
   series: EvaluationSeries,
-  metric: BenchmarkMetric,
 ): (number | null)[] {
   const own = new Set(series.indices);
-  return metricValues(evaluations, metric).map((v, i) => (own.has(i) ? v : null));
+  return scoreValues(evaluations).map((v, i) => (own.has(i) ? v : null));
 }

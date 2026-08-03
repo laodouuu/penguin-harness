@@ -15,15 +15,14 @@ export const zh = {
   nav: {
     chat: "对话",
     newChat: "新对话",
-    agents: "智能体仓库",
+    agents: "智能体",
     skills: "技能库",
-    models: "模型仓库",
+    models: "模型库",
     usage: "成本中心",
     traces: "轨迹观测",
     benchmark: "评估中心",
-    // Collapsed-rail tooltips (product-specified wording; new chat reuses chat.newSessionMenu, the other pages reuse the page names above).
+    // Collapsed-rail tooltip (product-specified wording; new chat reuses chat.newSessionMenu, the other pages reuse the page names above).
     lastConversation: "最近一次对话",
-    railAgents: "智能体",
     collapseSidebar: "收起侧栏",
     expandSidebar: "展开侧栏",
     collapseGroup: "折叠",
@@ -34,6 +33,8 @@ export const zh = {
 
   settings: {
     language: "语言",
+    /** Sidebar Session list: also show CLI-created Sessions (default off — the list then never scans the Trace directories). */
+    showCliSessions: "显示 CLI 会话",
     theme: "主题",
     themeLight: "浅色",
     themeDark: "深色",
@@ -62,9 +63,14 @@ export const zh = {
     /** Superscript badge on the version lines when the update check found a newer release (owner-specified wording). */
     newVersionBadge: "有新版本可用",
     newVersion: (v: string) => `新版本 v${v} 可用`,
-    /** Manual check action in the sidebar user menu (owner request), with its busy label and toast outcomes. */
+    /**
+     * 用户菜单里**唯一**的更新行：未知新版本时显示「检查更新」并执行手动检查；已知新版本后改为
+     * newVersion() 文案，点击打开更新弹窗（弹窗内含更新说明链接，管理员另有自更新操作）。
+     */
     checkNow: "检查更新",
     checking: "检查中…",
+    /** 手动检查发现新版本时的成功提示；下方同一行即变为更新入口。 */
+    foundNew: (v: string) => `发现新版本 v${v}，点击下方更新入口即可安装`,
     upToDate: "已是最新版本",
     checkFailed: "检查更新失败，请稍后重试",
     checkDisabled: "更新检查已关闭（PENGUIN_UPDATE_CHECK=off）",
@@ -77,6 +83,8 @@ export const zh = {
     unsupported: "当前安装方式不支持在线更新",
     confirmBody:
       "将下载最新版本并安装到服务器上的安装目录（数据目录不受影响）。安装完成后需要重启服务才会生效。",
+    /** 非管理员看到的说明（可查看更新说明，但不能在此执行更新），替代 confirmBody。 */
+    adminOnly: "只有管理员可以在这里执行更新。",
   },
 
   common: {
@@ -157,6 +165,8 @@ export const zh = {
     idHint: "2~64 位：小写字母开头，仅小写字母、数字与下划线；创建后不可修改",
     idPrefixHint: "id 固定以「用户名-」为前缀，后接小写字母、数字或下划线；创建后不可修改",
     name: "显示名（可选，缺省为 Project id）",
+    /** Project 设置里的显示名字段（此处必填，与新建对话框的「可选」措辞区分）。 */
+    displayName: "显示名",
     settings: "Project 设置",
     settingsTitle: "Project 设置",
     members: "成员",
@@ -531,16 +541,19 @@ export const zh = {
     tempWorkspaces: "临时工作区",
     newSessionInWorkspace: "在此工作区新建对话",
     draftSubtitle: "最擅长 AI 开发任务的自进化 Agent",
+    /** 首页示例的折叠分组名（书签式，同时只展开一个）。 */
+    exampleFolders: {
+      webapps: "搭建网页应用",
+      agents: "搭建和优化智能体",
+    },
     /**
-     * Example task cards on the draft screen: one click auto-submits the canned prompt (game
-     * card, then the LoL-player card, then the RAG card). These are the FULL working prompts — the README and
-     * landing page show a condensed one-sentence version of the RAG example for reading, and
-     * the cards' own desc lines stay short, but what actually gets submitted stays detailed:
-     * build quality depends on it.
+     * Example task cards on the draft screen: one click auto-submits the canned prompt. These
+     * are the FULL working prompts — descriptions stay short, but the submitted instructions
+     * remain detailed because execution quality depends on them.
      */
     exampleTasks: {
       game: {
-        label: "示例：2D 企鹅雪橇越野小游戏",
+        label: "2D 企鹅雪橇越野小游戏",
         desc: "可爱南极企鹅滑雪橇跳石头，难度由易到难的 2D 纯前端小游戏",
         prompt:
           "做一个可爱的南极企鹅滑雪橇越野 2D 小游戏：按空格键起跳，跃过冰面上迎面而来的石头；" +
@@ -549,8 +562,30 @@ export const zh = {
           "2D 横版画面、可爱卡通风，纯前端实现（单个 HTML 文件即可），界面遵循 web-design 技能。" +
           "完成后在浏览器里自测一次，确认开局能轻松玩过几秒，并告诉我怎么打开和怎么玩。",
       },
+      gamecenter: {
+        label: "多智能体搭建小游戏中心",
+        desc: "并行产出 10 个玩法互不重复的纯前端小游戏，配一个统一风格的索引首页",
+        prompt: `用多智能体并行搭建一个网页小游戏中心：10 个玩法互不重复的纯前端小游戏，外加一个索引首页。
+
+## 分工方式
+- 先规划这 10 个游戏（例如贪吃蛇、2048、俄罗斯方块、打砖块、扫雷、记忆翻牌、推箱子、太空射击、跳跃平台、节奏点击），确认玩法确实互不重复，并定好统一的目录结构、配色与交互规范。
+- 再把 10 个游戏分派给多个子智能体并行实现，每个子智能体只负责自己的那一个游戏，严格按既定规范产出，互不改动他人的文件。
+
+## 每个游戏
+- 独立的 \`games/<slug>/index.html\`，纯前端单文件、file:// 直接打开即可运行，不依赖后端与任何 CDN 资源。
+- 具备开始 / 重新开始、实时计分或计时、失败或通关结算，并同时支持键盘与触摸操作，页面内写明玩法说明。
+- 提供返回索引首页的入口。
+
+## 索引首页
+- 根目录 \`index.html\`：卡片网格列出全部 10 个游戏（名称 + 一句话玩法 + 操作方式），点击进入对应游戏。
+- 与所有游戏共用一套设计语言，遵循 web-design 技能。
+
+## 收尾
+- 统一验收：10 个游戏玩法确实不重复、风格一致，索引页的链接全部可达。
+- 在浏览器里逐个自测，确认都能开始、能结束、能重开，然后告诉我怎么打开。`,
+      },
       lol: {
-        label: "示例：英雄联盟音乐播放器",
+        label: "英雄联盟音乐播放器",
         desc: "用 SoundCloud Widget API 播放历届 Worlds 主题曲，单文件即开即用",
         prompt: `用 SoundCloud Widget API（见 https://developers.soundcloud.com/docs/api/html5-widget）做一个英雄联盟 Worlds 主题曲播放器，单文件 index.html，file:// 打开即用。
 
@@ -575,20 +610,54 @@ export const zh = {
 - 键盘快捷键：空格播放暂停、← → 切歌、↑ ↓ 调音量
 
 ## 设计
-Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html data-theme>），默认深色，localStorage 记忆。响应式：手机端侧边栏变为顶部横向滚动。
+Penguin 视觉风格（见 web-design 技能），默认深色。手机端侧边栏变为顶部横向滚动。
 
 完成后在浏览器打开 index.html 自测一次。`,
       },
       rag: {
-        label: "示例：构建 Claude Code 文档专家",
+        label: "构建 Claude Code 文档 RAG 智能体",
         desc: "收集 claude-code-docs 仓库，生成可对话、带来源引用的 RAG 知识应用",
         prompt:
           "收集 https://github.com/ericbuess/claude-code-docs 的文档，构建一个 RAG 知识应用：" +
           "克隆仓库并整理语料，建立检索索引；应用化身 Claude Code 配置专家，" +
           "检索增强回答 Claude Code 相关问题并标注可点击的来源引用——" +
           "引用要能展示命中的原文片段，并链接到真实文档；" +
-          "按 web-design 技能提供美观的 Web 聊天界面，空态展示几个示例问题。" +
-          "完成后运行应用、自测一个问题验证流式回答，并告诉我访问方式。",
+          "按 web-design 技能提供美观的 Web 聊天界面。" +
+          "完成后运行应用，用一个中文问题和一个英文问题各自测一次，" +
+          "确认两者都检索到了正确的英文文档、流式回答正常，并告诉我访问方式。",
+      },
+      agentBenchmarkBuild: {
+        label: "构建通用决策智能体和评测基准",
+        desc: "创建一个通用决策 Agent，并用足球、售后和投资任务检验它",
+        prompt: `请依次使用 \`agent-creation\` 和 \`benchmark-design\`，创建决策 Agent，并产出 Frozen Benchmark 与 Formal Baseline。
+
+Agent：
+- id：\`finite_choice_agent\`
+- 能力：面对有限选项，在公开信息不足或冲突时仍能给出稳定、可解释的选择
+- installed_skills：\`[]\`
+
+Benchmark：
+- id：\`contextual-choice-adaptation\`
+- capability：从公开规则、历史案例和当前事实中形成并迁移稳定的有限选择决策过程
+- runs：\`1\`
+- desired_baseline_score：\`<75\`
+- pilot_iteration_limit：\`5\`
+
+场景：
+1. 根据历史比赛与当前信息进行足球投注决策。
+2. 根据售后政策与工单事实选择处置动作。
+3. 根据投资策略、历史市场与当前指标选择投资动作。`,
+      },
+      agentOptimization: {
+        label: "优化通用决策智能体的准确率",
+        desc: "根据已有评测结果改进 Agent，并验证新版本是否真正提升",
+        prompt: `请使用 \`agent-optimization\`，根据 Frozen Benchmark 优化决策 Agent。
+
+- test_agent_id：\`finite_choice_agent\`
+- benchmark_id：\`contextual-choice-adaptation\`
+- capability_direction：提高信息不完整、规则冲突和有限选项决策中的稳定性
+- desired_score：\`>=95\`
+- candidate_round_limit：\`5\``,
       },
     },
     sessionList: "Session",
@@ -622,6 +691,8 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
     steerSend: "发送给运行中的 Agent",
     /** Queued hint shown after a successful steer, until the steering message appears in the stream. */
     steerQueuedIndicator: "插话已排队，将随下一轮送达",
+    /** Same hint, with the queued message's content (from the server's undelivered-steering mirror; survives reloads). */
+    steerQueuedItem: (content: string) => `插话已排队，将随下一轮送达：${content}`,
     /** Label of the [user_steering] chip (a mid-run user message delivered between turns). */
     userSteering: "用户插话",
     /** Mid-run send-mode setting: steer (delivered mid-run) vs follow-up (queued until the run ends). */
@@ -654,14 +725,23 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
     modelAuthDeadRetry: "重试",
     modelAuthDeadCta: "新建会话",
     modelAuthDeadPlaceholder: "模型认证失败，请先更新 API key",
-    /** Reconnect hint line; `secondsLeft` (waiting state only) switches to the live-countdown wording. */
+    /**
+     * Reconnect hint line; `secondsLeft` (waiting state only) switches to the live-countdown
+     * wording. `failed` is in the union because the engine retries it like the other two —
+     * its cause names the provider rather than the transport, since that is where it came from.
+     */
     reconnect: (
-      status: "timeout" | "malformed",
+      status: "failed" | "timeout" | "malformed",
       state: "waiting" | "retried" | "gaveUp",
       attempt: number,
       secondsLeft?: number,
     ) => {
-      const cause = status === "timeout" ? "连接超时或网络中断" : "响应不完整或无法解析";
+      const cause =
+        status === "timeout"
+          ? "连接超时或网络中断"
+          : status === "malformed"
+            ? "响应不完整或无法解析"
+            : "模型服务返回错误";
       const action =
         state === "gaveUp"
           ? "已停止重试"
@@ -700,14 +780,22 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
     openAgents: "智能体面板",
     /** File summary card at the end of a message (Codex-style): title, inline preview action, and collapsed row. */
     filesInMessage: (n: number) => `${n} 个文件`,
+    imagesInMessage: (n: number) => `${n} 张图片`,
     openPreview: "点击预览",
     showMoreFiles: (n: number) => `显示其余 ${n} 个文件`,
     showLess: "收起",
+    /** Reveal the next page of sidebar groups (#139); n = groups still hidden. */
+    moreGroups: (n: number) => `更多分组（${n}）`,
     contextUsage: "上下文占用",
     contextUnknown: "上下文占用：压缩后待下次请求回报",
     slashHint: "输入 / 使用命令",
-    mentionHint: "@ handoff 给其他 Agent",
-    mentionRemove: "移除 @ 目标",
+    /** `/agent` handoff: command description, picker title, search box, no-match hint, and the staged target's description and remove button. */
+    switchAgent: "交给其他 Agent，发送时开启新会话",
+    switchAgentTitle: "选择 Agent",
+    agentSearchPlaceholder: "搜索 Agent：id / 名称",
+    agentsNoMatch: "没有匹配的 Agent",
+    handoffTargetTitle: (agent: string) => `发送后交接给 ${agent}`,
+    handoffRemove: "移除交接目标",
     /** Skill multi-select dropdown (input toolbar): button text, search box, empty state, and no-match hint. */
     skillsSelect: "技能",
     skillRemove: "移除技能",
@@ -718,12 +806,16 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
     skillsAutoMessage: (names: string[]): string => `使用 ${names.join("、")} 技能`,
     handoffFrom: (agent: string) => `由 ${agent} 的对话交接而来`,
     handoffBack: (title?: string) => (title ? `回到原对话：${title}` : "回到原对话"),
-    /** /model 切换：命令描述、拾取器标题、切换来源横幅与空正文自动消息。 */
-    switchModel: "切换模型开启新会话延续本对话",
+    /** `/model` switch: command description, picker title, the staged target's description and remove button, the switch-origin banner, and the empty-body auto message. */
+    switchModel: "切换模型，发送时开启新会话延续本对话",
     switchModelTitle: "切换模型",
+    modelSwitchTargetTitle: (model: string) => `发送后换用 ${model} 延续本对话`,
+    modelSwitchRemove: "移除切换模型",
+    /** Why Send is disabled with a model switch staged: the fork branches off a Trace this Session is still writing. */
+    modelSwitchBusyHint: "本轮结束后才能切换模型：新会话要从当前会话的记录接续",
     modelSwitchFrom: (prevModel?: string) =>
       prevModel ? `已切换模型（原为 ${prevModel}），延续原会话` : "已切换模型，延续原会话",
-    /** /model 切换且正文为空时自动发送的首条消息正文（与 skillsAutoMessage 同一约定）。 */
+    /** First message body auto-sent when `/model` is staged and the composer is empty (same convention as skillsAutoMessage). */
     modelSwitchAutoMessage: "换用新模型继续这段对话",
     scheduledFrom: (name: string) => `由定时任务「${name}」触发`,
     emptyGreeting: "开始一段新对话",
@@ -756,10 +848,17 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
       archived: (n: number) => `已归档（${n}）`,
     },
     skillsBanner: (names: string[]): string => `使用技能：${names.join("、")}`,
-    /** Composer "+" extension menu (currently only goal mode; more entries later) and the goal chip. */
+    /** Attached-file notice above a user message (file names only; the paths stay in the Trace). */
+    attachedFilesBanner: (names: string[]): string => `附加文件：${names.join("、")}`,
+    /** Composer "+" extension menu (image upload, file attachment, goal mode) and the goal chip. */
     plusMenu: "更多输入方式",
     uploadImage: "上传图片",
     uploadImageDesc: "为本条消息附加图片",
+    uploadFile: "上传文件",
+    uploadFileDesc: "文件存入会话临时目录，模型按路径读取",
+    removeFile: "移除文件",
+    /** Toast for a picked file rejected before reading (the server's per-file cap is 10MB). */
+    attachmentTooLarge: (name: string): string => `${name} 超过 10MB 上限，未添加。`,
     goalMode: "目标模式",
     goalModeDesc: "循环运行直至目标完成",
     goalBudgetLabel: "Token 预算",
@@ -771,6 +870,8 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
     goalBudgetSave: "保存预算",
     goalRemove: "退出目标模式",
     goalRoundBanner: (round: number): string => `目标 · 第 ${round} 轮`,
+    /** Later rounds collapse the objective's images into this chip (round 1 shows them in full). */
+    goalRoundImages: (count: number): string => `${count} 张附图`,
     goalProgress: (rounds: number, tokens: string): string => `第 ${rounds} 轮 · tokens ${tokens}`,
     goalStatus: {
       active: "进行中",
@@ -846,6 +947,11 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
     errorsColKind: "类型",
     errorsColMessage: "消息",
     errorsEmpty: "暂无异常",
+    /** Detail-table pager: newer/older step back through pages of the same filtered set. */
+    errorsNewer: "较新",
+    errorsOlder: "更早",
+    errorsPageOf: (page: number, pages: number, total: number) =>
+      `第 ${page} / ${pages} 页 · 共 ${total} 条`,
   },
 
   traces: {
@@ -893,8 +999,14 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
     selectBenchmark: "在左侧选择一个 Benchmark",
     emptyAgent: "该 Agent 暂无 Benchmark",
     caseCount: (n: number): string => `${n} 题`,
-    /** Chart title, varies by selected metric (score / cost / duration over time). */
+    /** Score-only chart title. */
     trendTitle: (metric: string): string => `${metric}随时间变化`,
+    cases: "题目",
+    viewCase: "查看详情",
+    taskMaterials: "任务材料",
+    rubric: "评分标准",
+    agentHidden: "被测 Agent 不可见",
+    caseFileUnavailable: "案例文件暂时无法读取",
     evaluations: "评估明细",
     noEvaluations: "暂无评估记录",
     /** Evaluation notes (scoreboard's summary: score source and notes on this round's changes). */
@@ -902,8 +1014,9 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
     /** Chart legend: older evaluation records with no model label (gray series). */
     legendUnlabeled: "未标注模型",
     colVersion: "版本",
-    colModel: "模型",
-    colScore: "总分",
+    colModel: "模型 ID",
+    colThinkingLevel: "推理强度",
+    colScore: "Score",
     colDuration: "耗时",
     colCase: "题目",
     colRun: "运行",
@@ -935,6 +1048,7 @@ Penguin 视觉风格（见 web-design 技能），深色/浅色主题（<html da
       unknown_skill: "该技能不在技能库中。",
       file_not_found: "该文件已不存在。",
       file_too_large: "文件过大。",
+      too_many_files: "一条消息附加的文件过多。",
       payload_too_large: "请求体过大。",
       dir_not_absolute: "目录必须是绝对路径。",
       not_a_dir: "该路径不是目录。",

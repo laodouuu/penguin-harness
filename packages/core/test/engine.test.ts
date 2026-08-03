@@ -7,13 +7,14 @@
  * turn, until some turn produces no tool_call (Task done) or is interrupted. Approval/execution
  * are within-turn interactions, and execution can overlap.
  */
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   assistantText,
   emptyTokenCounts,
+  imageUrlMessage,
   isCompleteModelMessage,
   partialText,
   partialToolCallOutput,
@@ -32,7 +33,13 @@ import { Environment } from "../src/environment/index.js";
 import { Writer, readTrace } from "../src/trace/index.js";
 import { ContextEngine, reconnectDelayMs } from "../src/engine/context-engine.js";
 import { goalRoundMessage } from "../src/goal/goal-prompts.js";
+import { parseUserSteeringText } from "../src/omnimessage/markers/index.js";
+import { imagesToScratchpadPaths } from "../src/internal/session-support.js";
 import type { ApproveFn, EnvironmentInterface, ToolPermission } from "../src/interfaces.js";
+
+/** A real 1x1 PNG data URL: the non-vision fold actually decodes and writes it to disk. */
+const PNG_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 /** Deterministic fake LLM: the first turn yields a tool_call, the second yields the final reply. */
 class FakeLLM implements LLMInterface {
@@ -123,6 +130,33 @@ async function collectRun(
   return all;
 }
 
+/**
+ * Reads a file the shell just wrote, retrying briefly until it holds `expected`.
+ *
+ * A tool completes when its shell process exits, which does not promise the write is visible to
+ * this process yet — on Windows CI it intermittently is not, surfacing as ENOENT or stale
+ * content. Retrying asserts the same exact content; it only stops the assertion racing the
+ * filesystem, and a genuinely wrong write still fails one timeout later.
+ */
+async function readFileEventually(
+  file: string,
+  expected: string,
+  timeoutMs = 2000,
+): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  let last = "";
+  for (;;) {
+    last = await readFile(file, "utf8").catch(() => "");
+    if (last === expected || Date.now() >= deadline) return last;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+}
+
+/** Extracts the plain archive path from the note (the path is always last before `]`). */
+function recoveryPath(output: string): string | undefined {
+  return output.match(/\[output archived[^:]*: ([^\]]+)\]/)?.[1];
+}
+
 describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
   let workspace: string;
   let traces: string;
@@ -160,7 +194,9 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
         (m) => (m.payload as { type?: string }).type === "tool_call_output",
       ),
     ).toBe(true);
-    expect(await readFile(join(workspace, "hello.txt"), "utf8")).toBe("Hello, Penguin");
+    expect(await readFileEventually(join(workspace, "hello.txt"), "Hello, Penguin")).toBe(
+      "Hello, Penguin",
+    );
 
     const types = collected.map((m) => (m.payload as { type?: string }).type);
     expect(types).toContain("tool_call_output");
@@ -177,6 +213,112 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
     expect(recordedTypes).toContain("tool_call");
     expect(recordedTypes).toContain("tool_call_output");
     expect(recordedTypes.some((t) => t?.startsWith("partial_"))).toBe(false);
+  });
+
+  it("lets the next Agent turn recover truncated text, keeps UI == Agent output, and preserves it after Task end", async () => {
+    const NAME = "__recoverable_text_tool__";
+    const source = `BEGIN\n${"detail\n".repeat(100)}FINAL ANSWER\n`;
+    BUILTIN_TOOL_FACTORIES[NAME] = (definition) => ({
+      name: NAME,
+      definition,
+      async *execute(_args, ctx) {
+        yield partialToolCallOutput({
+          eventType: "delta",
+          output: source.slice(0, 200),
+          toolCallId: ctx.toolCallId,
+        });
+        yield partialToolCallOutput({
+          eventType: "delta",
+          output: source.slice(200),
+          toolCallId: ctx.toolCallId,
+        });
+      },
+    });
+    try {
+      let calls = 0;
+      let agentVisibleOutput = "";
+      let recoveredPath = "";
+      let recoveredDuringTask = "";
+      const llm: LLMInterface = {
+        async *streamGenerate(params): AsyncGenerator<OmniMessage, LLMOutcome> {
+          calls += 1;
+          if (calls === 1) {
+            yield toolCall({
+              name: NAME,
+              arguments: "{}",
+              toolCallId: "recover-call",
+              stopReason: "completed",
+            });
+            yield tokenUsage(emptyTokenCounts(), {
+              cache_read: 0,
+              cache_write: 0,
+              output: 1,
+              total: 1,
+            });
+            return { status: "completed" };
+          }
+          const toolResult = params.newMessages.find(
+            (m) => (m.payload as { type?: string }).type === "tool_call_output",
+          );
+          agentVisibleOutput = (toolResult?.payload as { output?: string }).output ?? "";
+          recoveredPath = recoveryPath(agentVisibleOutput) ?? "";
+          recoveredDuringTask = await readFile(recoveredPath, "utf8");
+          yield assistantText("Recovered the final answer.");
+          yield tokenUsage(emptyTokenCounts(), {
+            cache_read: 0,
+            cache_write: 0,
+            output: 1,
+            total: 2,
+          });
+          return { status: "completed" };
+        },
+      };
+      const environment = new Environment({
+        workspaceDir: workspace,
+        toolConfig: {
+          customTools: [
+            { name: NAME, description: "recover", permission: "r", maxOutputLength: 40 },
+          ],
+          mcpServers: [],
+        },
+        sessionScratchpadDir: join(workspace, "session-scratchpad"),
+      });
+      const trace = new Writer({ tracesDir: traces, sessionId: "sess_truncated_output" });
+      const engine = new ContextEngine({ llm, environment, trace });
+      const all = await collectRun(engine, [userText("recover it")], allowAll);
+
+      expect(recoveredDuringTask).toBe(source);
+      const frontendComplete = all.find(
+        (m) =>
+          (m.payload as { type?: string }).type === "tool_call_output" &&
+          (m.payload as { tool_call_id?: string }).tool_call_id === "recover-call",
+      );
+      expect((frontendComplete!.payload as { output: string }).output).toBe(agentVisibleOutput);
+      const frontendStream = all
+        .filter(
+          (m) =>
+            (m.payload as { type?: string }).type === "partial_tool_call_output" &&
+            (m.payload as { tool_call_id?: string }).tool_call_id === "recover-call" &&
+            (m.payload as { event_type?: string }).event_type === "delta",
+        )
+        .map((m) => (m.payload as { output?: string }).output ?? "")
+        .join("");
+      expect(frontendStream).toBe(agentVisibleOutput);
+
+      const recorded = await readTrace(trace.currentPath());
+      const tracedOutput = recorded.find(
+        (m) =>
+          (m.payload as { type?: string }).type === "tool_call_output" &&
+          (m.payload as { tool_call_id?: string }).tool_call_id === "recover-call",
+      );
+      expect((tracedOutput!.payload as { output: string }).output).toBe(agentVisibleOutput);
+
+      expect(await readFile(recoveredPath, "utf8")).toBe(source);
+      environment.dispose();
+      expect(await readFile(recoveredPath, "utf8")).toBe(source);
+    } finally {
+      delete BUILTIN_TOOL_FACTORIES[NAME];
+    }
   });
 
   it("a slow tool delays the run only by its own latency: the loop adds no waits, timers, or dropped wakes", async () => {
@@ -521,7 +663,7 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
     expect(texts.join("\n")).not.toContain("[turn_aborted]");
   });
 
-  it("downgrades a goal round's protocol in the [turn_aborted] transcript (LLM failure path)", async () => {
+  it("downgrades a goal round's protocol in the [turn_aborted] transcript (auth exit path)", async () => {
     // An aborted/failed goal round's input rides into the next task via flatten carry-over;
     // its [goal] protocol ("the system sends the next round automatically", the file rules)
     // is stale the moment the goal ends and must not re-enter the model as live instructions.
@@ -541,7 +683,8 @@ describe("ContextEngine ReAct loop (mock LLM, approve callback)", () => {
         if (++calls === 1) {
           yield partialText("start", "");
           yield partialText("delta", "half a thought");
-          return { status: "failed", message: "boom" };
+          // `auth`: the one LLM status that still exits straight to the flatten path.
+          return { status: "auth", message: "boom" };
         }
         yield assistantText("ok");
         yield tokenUsage(emptyTokenCounts(), {
@@ -980,8 +1123,8 @@ describe("ContextEngine async/incremental tool calls (overlapping execution)", (
       expect(firstCompleteAt["t2"]!).toBeLessThan(firstCompleteAt["t1"]!);
     }
 
-    expect(await readFile(join(workspace, "a.txt"), "utf8")).toBe("one");
-    expect(await readFile(join(workspace, "b.txt"), "utf8")).toBe("two");
+    expect(await readFileEventually(join(workspace, "a.txt"), "one")).toBe("one");
+    expect(await readFileEventually(join(workspace, "b.txt"), "two")).toBe("two");
     // Both tool outputs are fed back into the second turn, producing the final reply.
     expect(
       all.some(
@@ -1644,14 +1787,14 @@ describe("ContextEngine LLM timeout / network interruption (PRN-012)", () => {
     expect(nextRunTexts.join("\n")).not.toContain("[turn_aborted]");
   });
 
-  it("surfaces a non-retryable LLM failure (outcome=failed) as a graceful abort (run does not throw)", async () => {
+  it("a failed outcome retries like a timeout, then converges to a graceful abort (run does not throw)", async () => {
     let calls = 0;
     const inputs: OmniMessage[][] = [];
     const llm: LLMInterface = {
-      // The LLM must never throw an exception at the engine: a non-retryable error resolves
-      // by returning a failed outcome after closing the structure. A genuinely non-retryable
-      // failure nowadays is a parameter error (quota 403s retry as timeout, 401s carry
-      // code "auth" — both covered by their own tests below).
+      // The LLM must never throw an exception at the engine: an error resolves by returning
+      // a failed outcome after closing the structure. `failed` is still the honest
+      // classification for a parameter error — it is simply retried anyway, because the
+      // classifier cannot reliably tell a permanent 4xx from a gateway's transient one.
       // eslint-disable-next-line require-yield
       async *streamGenerate(params) {
         calls += 1;
@@ -1663,31 +1806,81 @@ describe("ContextEngine LLM timeout / network interruption (PRN-012)", () => {
       workspaceDir: workspace,
       toolConfig: execCommandToolConfig(),
     });
-    const engine = new ContextEngine({ llm, environment, reconnectBackoffMs: 0 });
+    const engine = new ContextEngine({
+      llm,
+      environment,
+      maxReconnects: 2,
+      reconnectBackoffMs: 0,
+    });
 
-    // Must not throw; should gracefully converge to an abort.
+    // Must not throw; should gracefully converge to an abort once the ladder is spent.
     const all = await collectRun(engine, [userText("go")], allowAll);
-    expect(calls).toBe(1); // failed -> no retry.
+    expect(calls).toBe(3); // initial attempt + maxReconnects(2): `failed` takes the ladder now.
     const abort = all.find((m) => (m.payload as { type?: string }).type === "abort");
     expect(abort).toBeDefined();
+    // Asserted whole, not by fragments: this string is shown verbatim in the error panel and
+    // the CLI and is persisted as the error message, so its grammar is part of the contract.
     const reason = (abort!.payload as { reason?: string }).reason ?? "";
-    expect(reason).toContain("llm request error");
-    expect(reason).toContain("unknown parameter");
+    expect(reason).toBe(
+      "llm request failed after 2 retries: 400 unknown parameter: max_output_tokens",
+    );
 
-    // The failed turn's input is flattened and stashed; the next run resends it merged with
-    // the new input.
+    // The spent turn's input is stashed as carry-over; the next run (attempt index 3, after
+    // this run's three) resends it merged with the new input.
     await collectRun(engine, [userText("next")], allowAll);
-    const text = inputs[1]!.map((m) => (m.payload as { text?: string }).text ?? "").join("\n");
+    const text = inputs[3]!.map((m) => (m.payload as { text?: string }).text ?? "").join("\n");
     expect(text).toContain("go");
     expect(text).toContain("next");
   });
 
-  it("an auth outcome stops immediately like failed: no retry, request_end carries status auth", async () => {
+  it("a failed request that succeeds on retry never reaches the user as an error", async () => {
+    // The point of retrying `failed`: the classifier is an allowlist, so a transient gateway
+    // fault phrased its own way ("Upstream HTTP/2 stream failed") lands here. It used to kill
+    // the turn; now the turn simply completes.
+    let calls = 0;
+    const llm: LLMInterface = {
+      async *streamGenerate() {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            status: "failed" as const,
+            message: "Upstream HTTP/2 stream failed (upstream_http2_stream_error)",
+          };
+        }
+        yield assistantText("recovered");
+        return { status: "completed" as const };
+      },
+    };
+    const engine = new ContextEngine({
+      llm,
+      environment: new Environment({
+        workspaceDir: workspace,
+        toolConfig: execCommandToolConfig(),
+      }),
+      reconnectBackoffMs: 0,
+    });
+    const all = await collectRun(engine, [userText("go")], allowAll);
+    expect(calls).toBe(2);
+    expect(all.find((m) => (m.payload as { type?: string }).type === "abort")).toBeUndefined();
+    // The failure is still classified `failed` on the wire — the retry is a policy decision,
+    // not a relabelling, so observability still sees a real failure rather than a "timeout".
+    const ends = all.filter((m) => (m.payload as { type?: string }).type === "request_end");
+    expect(ends.map((m) => (m.payload as { status?: string }).status)).toEqual([
+      "failed",
+      "completed",
+    ]);
+    // ...and it announces its retry wait like any other retryable failure, so the frontend
+    // countdown works for it too.
+    expect((ends[0]!.payload as { retry_in_ms?: number }).retry_in_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it("auth is the only LLM status that stops the run: no retry, request_end carries status auth", async () => {
     let calls = 0;
     const llm: LLMInterface = {
       // GenerativeModel classifies a 401/invalid_api_key as status "auth" (see
-      // llm.test.ts); the engine must stop directly — the auth/failed branch is the second
-      // belt keeping a dead credential out of the retry loop (the classifier is the first).
+      // llm.test.ts); the engine must stop directly — the auth branch is the second belt
+      // keeping a dead credential out of the retry loop (the classifier is the first).
+      // Every other failure, `failed` included, takes the ladder instead.
       // eslint-disable-next-line require-yield
       async *streamGenerate() {
         calls += 1;
@@ -1701,7 +1894,7 @@ describe("ContextEngine LLM timeout / network interruption (PRN-012)", () => {
     const engine = new ContextEngine({ llm, environment, reconnectBackoffMs: 1 });
 
     const all = await collectRun(engine, [userText("go")], allowAll);
-    expect(calls).toBe(1); // Auth behaves like failed: never enters the reconnect loop.
+    expect(calls).toBe(1); // A rejected credential cannot be retried into working.
     // The request's own terminal status is the host signal (streams to the web).
     const end = all.find((m) => (m.payload as { type?: string }).type === "request_end");
     expect((end!.payload as { status?: string }).status).toBe("auth");
@@ -1970,7 +2163,7 @@ describe("ContextEngine LLM timeout / network interruption (PRN-012)", () => {
     expect(all.map((m) => (m.payload as { type?: string }).type)).not.toContain("abort");
   });
 
-  it("flatten carry-over (failed exit) includes the model's partial thinking and text (PRN-014)", async () => {
+  it("flatten carry-over (auth exit) includes the model's partial thinking and text (PRN-014)", async () => {
     let calls = 0;
     const inputs: OmniMessage[][] = [];
     const llm: LLMInterface = {
@@ -1978,11 +2171,14 @@ describe("ContextEngine LLM timeout / network interruption (PRN-012)", () => {
         calls += 1;
         inputs.push(params.newMessages);
         if (calls === 1) {
-          // Before the non-retryable error, partial thinking and text were already produced
-          // (the LLM finishes them as complete messages, stop_reason failed).
+          // Before the terminal error, partial thinking and text were already produced (the
+          // LLM finishes them as complete messages). `auth` is the trigger because it is the
+          // one LLM status that still exits straight to the flatten path — `failed` now takes
+          // the reconnect ladder, whose carry-over is [turn_retried] instead (covered by the
+          // exhausted-retries test below).
           yield thinkingMessage("half-thought", "failed");
           yield assistantText("half-text", "failed");
-          return { status: "failed", message: "boom" };
+          return { status: "auth", message: "boom" };
         }
         yield assistantText("ok");
         yield tokenUsage(emptyTokenCounts(), {
@@ -2001,7 +2197,7 @@ describe("ContextEngine LLM timeout / network interruption (PRN-012)", () => {
     const engine = new ContextEngine({ llm, environment, reconnectBackoffMs: 0 });
 
     await collectRun(engine, [userText("go")], allowAll);
-    expect(calls).toBe(1); // failed -> no retry, exits immediately.
+    expect(calls).toBe(1); // auth -> no retry, exits immediately.
 
     // Next run: the flattened carry-over contains the original input plus partial thinking/text
     // (both completed and incomplete messages are carried over).
@@ -2221,13 +2417,13 @@ describe("ContextEngine mid-run steering ([user_steering])", () => {
     const engine = new ContextEngine({ llm, environment: steeringEnvironment(), trace });
 
     // Idle: nothing running yet -> steer refuses, the host falls back to a normal task.
-    expect(engine.steer("too early")).toBe(false);
+    expect(engine.steer([userText("too early")])).toBe(false);
 
     // Queue two messages while the task runs (deterministically: from the approval callback,
     // i.e. after the tool_call streamed but before the tool executed).
     const approve: ApproveFn = async () => {
-      expect(engine.steer("focus on the tests")).toBe(true);
-      expect(engine.steer("also update the docs")).toBe(true);
+      expect(engine.steer([userText("focus on the tests")])).toBe(true);
+      expect(engine.steer([userText("also update the docs")])).toBe(true);
       return "allow";
     };
     const all = await collectRun(engine, [userText("go")], approve);
@@ -2265,7 +2461,7 @@ describe("ContextEngine mid-run steering ([user_steering])", () => {
     expect((recordedOutputs[0]!.payload as { output: string }).output).toBe("tool result");
 
     // Task over: the queue window is closed again.
-    expect(engine.steer("late")).toBe(false);
+    expect(engine.steer([userText("late")])).toBe(false);
   });
 
   it("delivers steering left at loop end as a [user_steering] continuation turn (traced, streamed)", async () => {
@@ -2279,7 +2475,7 @@ describe("ContextEngine mid-run steering ([user_steering])", () => {
         inputs.push(params.newMessages);
         if (inputs.length === 1) {
           yield assistantText("final answer");
-          expect(engineRef!.steer("one more thing")).toBe(true);
+          expect(engineRef!.steer([userText("one more thing")])).toBe(true);
           return { status: "completed" };
         }
         yield assistantText("handled the follow-up");
@@ -2301,6 +2497,206 @@ describe("ContextEngine mid-run steering ([user_steering])", () => {
     expect(steeringTexts(await readTrace(trace.currentPath()))).toEqual([wrapped]);
   });
 
+  /** Image URLs of the image messages in a list, in order. */
+  const steeredImages = (msgs: OmniMessage[]): string[] =>
+    msgs
+      .map((m) => m.payload as { type?: string; image_url?: string })
+      .filter((p) => p.type === "image_url")
+      .map((p) => p.image_url!);
+
+  it("carries a steering message's images right behind its text (vision model), streamed and traced with it", async () => {
+    // An image with no caption is a complete steering message on its own; each entry's images
+    // follow that entry's text, so two steers stay distinguishable in the delivered order.
+    let engineRef: ContextEngine | null = null;
+    const inputs: OmniMessage[][] = [];
+    const llm: LLMInterface = {
+      async *streamGenerate(params): AsyncGenerator<OmniMessage, LLMOutcome> {
+        inputs.push(params.newMessages);
+        if (inputs.length === 1) {
+          expect(engineRef!.steer([imageUrlMessage("data:image/png;base64,AAAA")])).toBe(true);
+          expect(
+            engineRef!.steer([
+              userText("this one too"),
+              imageUrlMessage("data:image/png;base64,BBBB"),
+            ]),
+          ).toBe(true);
+          yield assistantText("final answer");
+          return { status: "completed" };
+        }
+        yield assistantText("looked at both");
+        return { status: "completed" };
+      },
+    };
+    const trace = new Writer({ tracesDir: traces, sessionId: "sess_steer_img" });
+    const engine = new ContextEngine({ llm, environment: steeringEnvironment(), trace });
+    engineRef = engine;
+
+    const all = await collectRun(engine, [userText("go")], allowAll);
+
+    expect(inputs).toHaveLength(2);
+    expect(
+      inputs[1]!.map((m) => {
+        const p = m.payload as { type: string; text?: string; image_url?: string };
+        return p.type === "image_url" ? `img:${p.image_url}` : p.text;
+      }),
+    ).toEqual([
+      "[user_steering]\n\n[/user_steering]",
+      "img:data:image/png;base64,AAAA",
+      "[user_steering]\nthis one too\n[/user_steering]",
+      "img:data:image/png;base64,BBBB",
+    ]);
+    // Streamed and traced like the text they belong to (a plain run never yields its Prompt,
+    // so these are the steering images and nothing else).
+    const expectedImages = ["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"];
+    expect(steeredImages(all)).toEqual(expectedImages);
+    expect(steeredImages(await readTrace(trace.currentPath()))).toEqual(expectedImages);
+  });
+
+  it("without vision, a steering message's images fold into [attached image: …] lines INSIDE the block", async () => {
+    // The block must stay the whole text: lines appended after the closing tag would cost the
+    // message its steering identity (parseUserSteeringText) and read as a new Task everywhere.
+    const scratch = await mkdtemp(join(tmpdir(), "penguin-steer-img-"));
+    try {
+      let engineRef: ContextEngine | null = null;
+      const inputs: OmniMessage[][] = [];
+      const llm: LLMInterface = {
+        async *streamGenerate(params): AsyncGenerator<OmniMessage, LLMOutcome> {
+          inputs.push(params.newMessages);
+          if (inputs.length === 1) {
+            expect(
+              engineRef!.steer([userText("look at this"), imageUrlMessage(PNG_DATA_URL)]),
+            ).toBe(true);
+            // An image with no caption of its own: the whole steering message is the picture.
+            expect(engineRef!.steer([imageUrlMessage(PNG_DATA_URL)])).toBe(true);
+            yield assistantText("final answer");
+            return { status: "completed" };
+          }
+          yield assistantText("read the file");
+          return { status: "completed" };
+        },
+      };
+      const engine = new ContextEngine({
+        llm,
+        environment: steeringEnvironment(),
+        foldInputImages: (messages) => imagesToScratchpadPaths(messages, scratch),
+      });
+      engineRef = engine;
+      await collectRun(engine, [userText("go")], allowAll);
+
+      // Both entries arrive as text and nothing else — every image became a line inside a block.
+      expect(inputs[1]!.map((m) => (m.payload as { type: string }).type)).toEqual(["text", "text"]);
+      const inner = inputs[1]!.map((m) =>
+        parseUserSteeringText((m.payload as { text: string }).text),
+      );
+      expect(inner[0]).toMatch(/^look at this\n\n\[attached image: .+\]$/);
+      // The caption-less one is the path line and nothing else: no blank line standing in for
+      // the text that was never sent.
+      expect(inner[1]).toMatch(/^\[attached image: .+\]$/);
+      // Both files really landed in the scratchpad.
+      expect(await readdir(scratch)).toHaveLength(2);
+    } finally {
+      await rm(scratch, { recursive: true, force: true });
+    }
+  });
+
+  // Session hands the engine the same throwing fold a Prompt gets: an unwritable scratchpad
+  // ends the run rather than dropping the attachment and carrying on. The picture usually
+  // arrives BECAUSE the run is going the wrong way, so continuing without it would spend the
+  // rest of the Task heading further that way.
+  it("a steering fold that fails ends the run instead of carrying on without the images", async () => {
+    let engineRef: ContextEngine | null = null;
+    const inputs: OmniMessage[][] = [];
+    const llm: LLMInterface = {
+      async *streamGenerate(params): AsyncGenerator<OmniMessage, LLMOutcome> {
+        inputs.push(params.newMessages);
+        if (inputs.length === 1) {
+          expect(
+            engineRef!.steer([
+              userText("look at this"),
+              imageUrlMessage("data:image/png;base64,AAAA"),
+            ]),
+          ).toBe(true);
+        }
+        yield assistantText("final answer");
+        return { status: "completed" };
+      },
+    };
+    const engine = new ContextEngine({
+      llm,
+      environment: steeringEnvironment(),
+      foldInputImages: () =>
+        Promise.reject(Object.assign(new Error("ENOSPC: no space left"), { code: "ENOSPC" })),
+    });
+    engineRef = engine;
+
+    await expect(collectRun(engine, [userText("go")], allowAll)).rejects.toThrow(/ENOSPC/);
+    // It ended at delivery: no second request went out carrying a note in place of the image.
+    expect(inputs).toHaveLength(1);
+  });
+
+  it("a fold returning an unreadable shape names the broken contract instead of carrying on", async () => {
+    // foldInputImages is public API (ContextEngineDeps is exported), so a third-party adapter
+    // can return the wrong thing. Sending the images on as messages would be the worse answer:
+    // a fold is configured precisely because the model does not take images.
+    let engineRef: ContextEngine | null = null;
+    const inputs: OmniMessage[][] = [];
+    const llm: LLMInterface = {
+      async *streamGenerate(params): AsyncGenerator<OmniMessage, LLMOutcome> {
+        inputs.push(params.newMessages);
+        if (inputs.length === 1) {
+          expect(
+            engineRef!.steer([
+              userText("look at this"),
+              imageUrlMessage("data:image/png;base64,AAAA"),
+            ]),
+          ).toBe(true);
+        }
+        yield assistantText("final answer");
+        return { status: "completed" };
+      },
+    };
+    const engine = new ContextEngine({
+      llm,
+      environment: steeringEnvironment(),
+      foldInputImages: async () => [],
+    });
+    engineRef = engine;
+
+    await expect(collectRun(engine, [userText("go")], allowAll)).rejects.toThrow(
+      /foldInputImages must return/,
+    );
+    expect(inputs).toHaveLength(1);
+  });
+
+  it("a steering message with neither text nor images queues nothing (and asks for no fallback)", async () => {
+    // `false` means "no Task running — send it as a normal task", which would be the wrong
+    // advice for an empty message; so it returns true and simply delivers nothing.
+    let engineRef: ContextEngine | null = null;
+    const inputs: OmniMessage[][] = [];
+    const llm: LLMInterface = {
+      async *streamGenerate(params): AsyncGenerator<OmniMessage, LLMOutcome> {
+        inputs.push(params.newMessages);
+        if (inputs.length === 1) {
+          expect(engineRef!.steer([userText("   ")])).toBe(true);
+          yield assistantText("final answer");
+          return { status: "completed" };
+        }
+        yield assistantText("must not happen");
+        return { status: "completed" };
+      },
+    };
+    const engine = new ContextEngine({ llm, environment: steeringEnvironment() });
+    engineRef = engine;
+    const all = await collectRun(engine, [userText("go")], allowAll);
+
+    // Nothing queued -> the turn produced no tool calls and no steering, so the Task ends.
+    expect(inputs).toHaveLength(1);
+    const userTexts = all.filter(
+      (m) => m.type === "model_msg" && (m.payload as { role?: string }).role === "user",
+    );
+    expect(userTexts).toHaveLength(0);
+  });
+
   it("steering queued during a mid-run compaction is delivered right after it (never swallowed)", async () => {
     // Turn 1 completes over the context threshold -> summarize compaction runs on the old
     // LLM; the user steers DURING the compaction request (the acceptance window stays open);
@@ -2312,7 +2708,7 @@ describe("ContextEngine mid-run steering ([user_steering])", () => {
         const texts = params.newMessages.map((m) => (m.payload as { text?: string }).text ?? "");
         if (texts.some((t) => t.includes("summary prompt"))) {
           // The compaction request: steering arrives while it streams.
-          expect(engineRef!.steer("switch to staging")).toBe(true);
+          expect(engineRef!.steer([userText("switch to staging")])).toBe(true);
           yield assistantText("[summary]the gist[/summary]");
           yield tokenUsage(emptyTokenCounts(), {
             cache_read: 0,
@@ -2371,7 +2767,7 @@ describe("ContextEngine mid-run steering ([user_steering])", () => {
     const engine = new ContextEngine({ llm, environment: steeringEnvironment() });
     const ac = new AbortController();
     const approve: ApproveFn = async () => {
-      expect(engine.steer("stale steering")).toBe(true);
+      expect(engine.steer([userText("stale steering")])).toBe(true);
       ac.abort();
       return "allow";
     };
@@ -2379,7 +2775,7 @@ describe("ContextEngine mid-run steering ([user_steering])", () => {
     expect(first.some((m) => (m.payload as { type?: string }).type === "abort")).toBe(true);
 
     // Aborted: whatever was queued is dropped with the run (documented steering contract).
-    expect(engine.steer("after abort")).toBe(false);
+    expect(engine.steer([userText("after abort")])).toBe(false);
     await collectRun(engine, [userText("continue")], allowAll);
     const followUpTexts = (llm.receivedSecondInput ?? [])
       .map((m) => {

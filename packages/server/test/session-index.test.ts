@@ -7,7 +7,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { sessionMeta, userText } from "@prismshadow/penguin-core";
-import type { SessionMetaPayload } from "@prismshadow/penguin-core";
+import type { OmniMessage, SessionMetaPayload } from "@prismshadow/penguin-core";
 import type {
   ProjectCreateResponse,
   SessionCreateResponse,
@@ -194,7 +194,7 @@ describe("session-index", () => {
       sessionMeta(junkMeta),
       userText("junk"),
     ]);
-    const list = (await (await api.get(base())).json()) as SessionsResponse;
+    const list = (await (await api.get(`${base()}?cli=1`)).json()) as SessionsResponse;
     expect(list.sessions.find((s) => s.sessionId === adopted)?.source).toBe("schedule");
     expect(list.sessions.find((s) => s.sessionId === junk)?.source).toBeUndefined();
   });
@@ -395,7 +395,13 @@ describe("session-index", () => {
       userText("cli session"),
     ]);
 
-    const list = (await (await api.get(base())).json()) as SessionsResponse;
+    // The default list is DB-only (web rows): an unmanaged CLI Trace is neither listed
+    // nor adopted by it (#139 — no Trace-directory scanning on the default path).
+    const webOnly = (await (await api.get(base())).json()) as SessionsResponse;
+    expect(webOnly.sessions.find((s) => s.sessionId === discovered)).toBeUndefined();
+    expect((await api.get(`/api/sessions/${discovered}`)).status).toBe(404);
+
+    const list = (await (await api.get(`${base()}?cli=1`)).json()) as SessionsResponse;
     const found = list.sessions.find((s) => s.sessionId === discovered);
     expect(found).toBeDefined();
     expect(found!.modelId).toBe("cli-model");
@@ -404,9 +410,31 @@ describe("session-index", () => {
     expect(found!.hasTrace).toBe(true);
     expect(found!.createdAt).toBe(sessionIdCreatedAt(discovered));
 
-    // Already indexed: visible via the single-lookup endpoint.
+    // Adopted as client "cli": the default list still excludes it afterwards, and counts
+    // follow the same filter…
+    const after = (await (await api.get(`${base()}?counts=1`)).json()) as SessionsResponse;
+    expect(after.sessions.find((s) => s.sessionId === discovered)).toBeUndefined();
+    expect(after.counts!.active).toBe(0);
+    // …but the adopted row makes the Session individually reachable (deep links work).
     const single = await api.get(`/api/sessions/${discovered}`);
     expect(single.status).toBe(200);
+  });
+
+  it("legacy rows without a client marker stay visible by default (grandfathered as web)", async () => {
+    const legacy = "session-2026-07-02-09-00-00-0abc0001";
+    t.deps.sessionsRepo.insert({
+      sessionId: legacy,
+      projectId,
+      agentId: "default_agent",
+      provider: "custom",
+      modelId: "m-legacy",
+      workspace: "/tmp/w-legacy",
+      approvalMode: "allow-all",
+      title: null,
+      createdAt: "2026-07-02T09:00:00.000Z",
+    });
+    const list = (await (await api.get(base())).json()) as SessionsResponse;
+    expect(list.sessions.find((s) => s.sessionId === legacy)).toBeDefined();
   });
 
   it("DELETE Session: clears the index row and every Trace shard; the list doesn't resurrect it; re-delete 404", async () => {
@@ -484,7 +512,7 @@ describe("session-index", () => {
       }),
     ]);
     const created = (await (await api.post(base(), {})).json()) as SessionCreateResponse;
-    const list = (await (await api.get(base())).json()) as SessionsResponse;
+    const list = (await (await api.get(`${base()}?cli=1`)).json()) as SessionsResponse;
     expect(list.sessions[0]!.sessionId).toBe(created.session.sessionId);
     expect(list.sessions[list.sessions.length - 1]!.sessionId).toBe(older);
   });
@@ -594,14 +622,48 @@ describe("session-index", () => {
       });
       expect(bad.status).toBe(400);
     }
-    // Image parts have no place in the re-injected objective.
-    const image = await api.post(`/api/sessions/${session.sessionId}/tasks`, {
+    // An image alone states no goal: the objective is re-injected as text every round.
+    const imageOnly = await api.post(`/api/sessions/${session.sessionId}/tasks`, {
+      input: [{ type: "image_url", imageUrl: "data:image/png;base64,aGk=" }],
+      goal: {},
+    });
+    expect(imageOnly.status).toBe(400);
+    // With text alongside them the images are fine: they reach the manager, and core folds
+    // them into the objective as path lines from there. startGoal stands in for the run so
+    // the assertion is about validation alone — a real goal loop would still be settling
+    // after the test closed its database.
+    const started: OmniMessage[][] = [];
+    t.deps.manager.startGoal = async (sessionId, args) => {
+      started.push(args.input);
+      return { sessionId };
+    };
+    const withText = await api.post(`/api/sessions/${session.sessionId}/tasks`, {
       input: [
         { type: "text", text: "objective" },
         { type: "image_url", imageUrl: "data:image/png;base64,aGk=" },
       ],
       goal: {},
     });
-    expect(image.status).toBe(400);
+    expect(withText.status).toBe(202);
+    expect(started[0]?.map((m) => (m.payload as { type: string }).type)).toEqual([
+      "text",
+      "image_url",
+    ]);
+    // A file attachment is the one input a goal cannot take, images notwithstanding: nothing
+    // folds it into the objective every round re-injects, so it is refused before any upload
+    // is written to disk (startGoal is never reached).
+    const withFile = await api.post(`/api/sessions/${session.sessionId}/tasks`, {
+      input: [
+        { type: "text", text: "objective" },
+        {
+          type: "file",
+          fileName: "report.pdf",
+          dataUrl: `data:application/pdf;base64,${Buffer.from("PDF-BYTES").toString("base64")}`,
+        },
+      ],
+      goal: {},
+    });
+    expect(withFile.status).toBe(400);
+    expect(started).toHaveLength(1);
   });
 });

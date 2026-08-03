@@ -34,6 +34,9 @@ PenguinHarness 的全部运行数据都落在本地文件系统：配置是可�
         ├── traces/
         │   └── <yyyy-mm-dd>/<sessionId>_<index3>.jsonl
         ├── scratchpad/               # 临时文件，按 Session id 建子目录（如粘贴的图片）
+        ├── shared_env/               # 共享的解释器/工具环境（虚拟环境、pipx、各类缓存），由 Agent
+        │                             # 按需创建——属于系统提示词约定而非代码创建的路径，使工具在任何
+        │                             # 任务中都只装一次；项目自身的依赖仍留在项目内
         ├── workspaces/               # 临时 Workspace（tmp-<8hex>）
         ├── benchmarks/               # 能力评测题库与得分
         └── snapshots/                # Agent State 版本快照
@@ -65,6 +68,8 @@ Trace 是 append-only 的 JSON Lines 文件，每行一个 OmniMessage 信封（
 {"timestamp":"…","type":"event_msg","payload":{"type":"token_usage","session":{…},"request":{…}}}
 ```
 
+工具输出超过 `maxOutputLength` 时，Trace 与 Web/CLI、模型一样只记录有界头部、截断提示和绝对 Session recovery 路径，不重复保存归档正文。该路径会暴露宿主的数据根目录布局；未经脱敏的 recovery 文件位于该 Session 的 scratchpad，因此路径跨 Task 和 Session 恢复保持有效。用户明确删除 Session 时，现有删除路径会连同 scratchpad 和 recovery 文件一起清理。因而 Trace 重放既忠实恢复「模型当时看到了什么」，也为后续追问保留可用指针。
+
 ## Session 恢复
 
 Trace 是恢复的唯一事实来源，没有独立的会话数据库需要与之对齐。`resumeSession` 的流程：
@@ -81,7 +86,7 @@ Trace 是恢复的唯一事实来源，没有独立的会话数据库需要与�
 
 ## 模型切换（/model）
 
-Web 的 `/model` 命令按 @ handoff 的方式换模型：用普通的会话创建接口在同一 Agent 下新建一个 Session（选定新模型，**沿用源会话的 Workspace**，文件因此保持可达），首条消息以 `[model_switch_from]` 源块开头——携带源会话 id、其最新 Trace 文件的绝对路径、Workspace 与原模型二元组，用户输入的剩余文字紧随其后。历史**不注入**新上下文：部分模型回放历史时要求 thinking 与 `fidelity` 逐字一致，跨模型注入不可行——模型需要早前上下文时按路径自行读取源 Trace 文件（JSONL，每行一个消息信封）。源会话与其 Trace 不受任何影响。
+Web 的 `/model` 命令按 `/agent` 交接的方式换模型：选中模型只是在输入框暂存，发送时才用普通的会话创建接口在同一 Agent 下新建一个 Session（选定新模型，**沿用源会话的 Workspace**，文件因此保持可达），首条消息以 `[model_switch_from]` 源块开头——携带源会话 id、其最新 Trace 文件的绝对路径、Workspace 与原模型二元组，用户输入的剩余文字紧随其后。历史**不注入**新上下文：部分模型回放历史时要求 thinking 与 `fidelity` 逐字一致，跨模型注入不可行——模型需要早前上下文时按路径自行读取源 Trace 文件（JSONL，每行一个消息信封）。源会话与其 Trace 不受任何影响。
 
 ## 字段保真
 

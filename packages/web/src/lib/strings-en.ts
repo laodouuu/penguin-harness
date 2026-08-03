@@ -16,13 +16,11 @@ export const en: Strings = {
     agents: "Agents",
     skills: "Skills",
     models: "Models",
-    usage: "Costs",
-    traces: "Trajectory",
+    usage: "Cost Center",
+    traces: "Trajectories",
     benchmark: "Evaluation Center",
-    // Collapsed-rail tooltips (product-specified wording; new chat reuses chat.newSessionMenu, the other pages reuse the page names above).
+    // Collapsed-rail tooltip (product-specified wording; new chat reuses chat.newSessionMenu, the other pages reuse the page names above).
     lastConversation: "Last conversation",
-    // Deliberately equal to nav.agents: the key exists for the zh-only wording difference (智能体 vs 智能体仓库).
-    railAgents: "Agents",
     collapseSidebar: "Collapse sidebar",
     expandSidebar: "Expand sidebar",
     collapseGroup: "Collapse",
@@ -33,6 +31,8 @@ export const en: Strings = {
 
   settings: {
     language: "Language",
+    /** Sidebar Session list: also show CLI-created Sessions (default off — the list then never scans the Trace directories). */
+    showCliSessions: "Show CLI sessions",
     theme: "Theme",
     themeLight: "Light",
     themeDark: "Dark",
@@ -61,9 +61,16 @@ export const en: Strings = {
     /** Superscript badge on the version lines when the update check found a newer release. */
     newVersionBadge: "New version available",
     newVersion: (v: string) => `New version v${v} available`,
-    /** Manual check action in the sidebar user menu, with its busy label and toast outcomes. */
+    /**
+     * The sidebar user menu's SINGLE update row: it reads "Check for updates" until a newer
+     * release is known and runs the manual check; once one is known it reads newVersion() and
+     * opens the update dialog instead (which carries the release-notes link and, for admins,
+     * the self-update action).
+     */
     checkNow: "Check for updates",
     checking: "Checking…",
+    /** Success toast when the manual check finds a newer release; the row below turns into the update entry. */
+    foundNew: (v: string) => `New version v${v} found — use the update entry below to install`,
     upToDate: "You're on the latest version",
     checkFailed: "Update check failed — try again later",
     checkDisabled: "Update checks are disabled (PENGUIN_UPDATE_CHECK=off)",
@@ -76,6 +83,8 @@ export const en: Strings = {
     unsupported: "This install cannot be updated from the web UI",
     confirmBody:
       "Downloads the latest release and installs it into the install directory on the server (the data directory is not touched). Restart the service afterwards for the update to take effect.",
+    /** Shown in place of confirmBody to non-admins, who can read the release notes but cannot run the update. */
+    adminOnly: "Only an administrator can run the update from here.",
   },
 
   common: {
@@ -162,6 +171,8 @@ export const en: Strings = {
     idPrefixHint:
       "The id is prefixed with your username and a hyphen; append lowercase letters, digits or underscores. Cannot be changed later.",
     name: "Display name (optional, defaults to the Project id)",
+    /** The display-name field in Project settings (required there, unlike the create dialog's optional one). */
+    displayName: "Display name",
     settings: "Project settings",
     settingsTitle: "Project settings",
     members: "Members",
@@ -548,9 +559,14 @@ export const en: Strings = {
     tempWorkspaces: "Temp workspaces",
     newSessionInWorkspace: "New chat in this workspace",
     draftSubtitle: "The self-evolving agent that excels at AI development tasks",
+    /** Folder names for the draft page's collapsible examples (bookmark-style: exactly one open at a time). */
+    exampleFolders: {
+      webapps: "Build web apps",
+      agents: "Build and optimize agents",
+    },
     exampleTasks: {
       game: {
-        label: "Example: 2D penguin sled game",
+        label: "2D penguin sled game",
         desc: "A cute Antarctic penguin sleds over rocks, easy start with a gentle difficulty ramp — a 2D pure-frontend mini game",
         prompt:
           "Build a cute Antarctic penguin sledding 2D game: press Space to jump over the rocks " +
@@ -562,8 +578,30 @@ export const en: Strings = {
           "When done, test it in a browser once, confirm the first few seconds are easy to " +
           "clear, and tell me how to open it and how to play.",
       },
+      gamecenter: {
+        label: "A mini-game center built by multiple agents",
+        desc: "Ten pure-frontend games with no repeated mechanics, built in parallel behind one index page",
+        prompt: `Build a web mini-game center with multiple agents working in parallel: 10 pure-frontend games with no two sharing the same mechanic, plus an index page.
+
+## How to split the work
+- First plan the 10 games (say snake, 2048, tetris, breakout, minesweeper, memory match, sokoban, space shooter, platform jumper, rhythm tap), confirm no two mechanics repeat, and fix a shared directory layout, palette and interaction spec.
+- Then hand the 10 games to several subagents to implement in parallel — each subagent owns exactly one game, follows the agreed spec, and never edits another's files.
+
+## Each game
+- Its own \`games/<slug>/index.html\`: pure frontend, a single file that runs straight from file://, with no backend and no CDN assets.
+- Start / restart, live score or timer, a lose-or-clear summary, both keyboard and touch controls, and the rules written on the page.
+- A way back to the index page.
+
+## Index page
+- \`index.html\` at the root: a card grid listing all 10 games (name + one-line mechanic + controls), each card opening its game.
+- One design language shared with every game, following the web-design skill.
+
+## Wrap-up
+- Review as a whole: the 10 mechanics really are distinct, the styling is consistent, and every index link resolves.
+- Self-test each game in a browser — it starts, it ends, it restarts — then tell me how to open it.`,
+      },
       lol: {
-        label: "Example: League of Legends music player",
+        label: "League of Legends music player",
         desc: "Worlds anthems on the SoundCloud Widget API — a single file that opens from file://",
         prompt: `Build a League of Legends Worlds anthem player with the SoundCloud Widget API (see https://developers.soundcloud.com/docs/api/html5-widget): a single index.html that works when opened from file://.
 
@@ -588,12 +626,12 @@ export const en: Strings = {
 - Keyboard shortcuts: Space play/pause, ← → previous/next, ↑ ↓ volume
 
 ## Design
-Penguin visual style (see the web-design skill), dark/light themes via <html data-theme>, dark by default, remembered in localStorage. Responsive: on phones the sidebar becomes a horizontally scrolling top bar.
+Penguin visual style (see the web-design skill), dark by default. On phones the sidebar becomes a horizontally scrolling top bar.
 
 When done, open index.html in a browser and self-test once.`,
       },
       rag: {
-        label: "Example: build a Claude Code docs expert",
+        label: "Build a Claude Code docs RAG agent",
         desc: "Collect the claude-code-docs repo into a conversational RAG knowledge app with source citations",
         prompt:
           "Collect the docs from https://github.com/ericbuess/claude-code-docs and build a RAG knowledge app: " +
@@ -601,8 +639,42 @@ When done, open index.html in a browser and self-test once.`,
           "the app acts as a Claude Code configuration expert, answering Claude Code questions " +
           "with retrieval-augmented replies and clickable citations that reveal the matched " +
           "original text chunk and link to the real documents; " +
-          "give it a beautiful web chat UI following the web-design skill, with a few example questions in the empty state. " +
-          "When done, run the app, verify one streamed answer yourself, and tell me how to access it.",
+          "give it a beautiful web chat UI following the web-design skill. " +
+          "When done, run the app and self-test one Chinese question and one English question, confirming both retrieve " +
+          "the right English documents and stream their answers, then tell me how to access it.",
+      },
+      agentBenchmarkBuild: {
+        label: "Build a general-purpose decision agent and its benchmark",
+        desc: "Create a general decision Agent and test it on football, after-sales, and investment tasks",
+        prompt: `Use \`agent-creation\` followed by \`benchmark-design\` to create a decision Agent and produce a frozen Benchmark with a Formal Baseline.
+
+Agent:
+- id: \`finite_choice_agent\`
+- capability: make stable, explainable finite choices when public information is incomplete or conflicting
+- installed_skills: \`[]\`
+
+Benchmark:
+- id: \`contextual-choice-adaptation\`
+- capability: form and transfer a stable finite-choice decision process from public rules, historical examples, and current facts
+- runs: \`1\`
+- desired_baseline_score: \`<75\`
+- pilot_iteration_limit: \`5\`
+
+Scenarios:
+1. Make football betting decisions from historical matches and current information.
+2. Choose after-sales actions from policy and ticket facts.
+3. Choose investment actions from a strategy, historical markets, and current indicators.`,
+      },
+      agentOptimization: {
+        label: "Improve the general-purpose decision agent's accuracy",
+        desc: "Improve an Agent from existing evaluation results and verify that the new version is better",
+        prompt: `Use \`agent-optimization\` to optimize a decision Agent against its frozen Benchmark.
+
+- test_agent_id: \`finite_choice_agent\`
+- benchmark_id: \`contextual-choice-adaptation\`
+- capability_direction: improve stability under incomplete information, conflicting rules, and finite choices
+- desired_score: \`>=95\`
+- candidate_round_limit: \`5\``,
       },
     },
     sessionList: "Sessions",
@@ -636,6 +708,9 @@ When done, open index.html in a browser and self-test once.`,
     steerSend: "Send to the running agent",
     /** Queued hint shown after a successful steer, until the steering message appears in the stream. */
     steerQueuedIndicator: "Steering queued — delivered with the next turn",
+    /** Same hint, with the queued message's content (from the server's undelivered-steering mirror; survives reloads). */
+    steerQueuedItem: (content: string) =>
+      `Steering queued — delivered with the next turn: ${content}`,
     /** Label of the [user_steering] chip (a mid-run user message delivered between turns). */
     userSteering: "User steering",
     /** Mid-run send-mode setting: steer (delivered mid-run) vs follow-up (queued until the run ends). */
@@ -671,15 +746,23 @@ When done, open index.html in a browser and self-test once.`,
     modelAuthDeadRetry: "Retry",
     modelAuthDeadCta: "New Session",
     modelAuthDeadPlaceholder: "Model authentication failed — update the API key first",
-    /** Reconnect hint line; `secondsLeft` (waiting state only) switches to the live-countdown wording. */
+    /**
+     * Reconnect hint line; `secondsLeft` (waiting state only) switches to the live-countdown
+     * wording. `failed` is in the union because the engine retries it like the other two —
+     * its cause names the provider rather than the transport, since that is where it came from.
+     */
     reconnect: (
-      status: "timeout" | "malformed",
+      status: "failed" | "timeout" | "malformed",
       state: "waiting" | "retried" | "gaveUp",
       attempt: number,
       secondsLeft?: number,
     ) => {
       const cause =
-        status === "timeout" ? "Connection timed out" : "Response incomplete or unparseable";
+        status === "timeout"
+          ? "Connection timed out"
+          : status === "malformed"
+            ? "Response incomplete or unparseable"
+            : "The model provider returned an error";
       const action =
         state === "gaveUp"
           ? "no further retries"
@@ -717,14 +800,21 @@ When done, open index.html in a browser and self-test once.`,
     openWorkspace: "Open workspace",
     openAgents: "Agents panel",
     filesInMessage: (n: number) => `${n} ${n === 1 ? "file" : "files"}`,
+    imagesInMessage: (n: number) => `${n} ${n === 1 ? "image" : "images"}`,
     openPreview: "Click to preview",
     showMoreFiles: (n: number) => `Show ${n} more ${n === 1 ? "file" : "files"}`,
     showLess: "Show less",
+    /** Reveal the next page of sidebar groups (#139); n = groups still hidden. */
+    moreGroups: (n: number) => `More groups (${n})`,
     contextUsage: "Context usage",
     contextUnknown: "Context usage: unknown until the next request reports it",
     slashHint: "Type / for commands",
-    mentionHint: "@ to handoff to another agent",
-    mentionRemove: "Remove @ target",
+    switchAgent: "Hand off to another agent — opens a new session on send",
+    switchAgentTitle: "Choose agent",
+    agentSearchPlaceholder: "Search agents: id / name",
+    agentsNoMatch: "No matching agents",
+    handoffTargetTitle: (agent: string) => `Sending hands this conversation to ${agent}`,
+    handoffRemove: "Remove handoff target",
     skillsSelect: "Skills",
     skillRemove: "Remove skill",
     skillsSearchPlaceholder: "Search skills",
@@ -735,8 +825,12 @@ When done, open index.html in a browser and self-test once.`,
     handoffFrom: (agent: string) => `Handed off from ${agent}'s conversation`,
     handoffBack: (title?: string) =>
       title ? `Back to the original conversation: ${title}` : "Back to the original conversation",
-    switchModel: "Switch model — continue this conversation in a new session",
+    switchModel: "Switch model — on send, continues this conversation in a new session",
     switchModelTitle: "Switch model",
+    modelSwitchTargetTitle: (model: string) => `Sending continues this conversation on ${model}`,
+    modelSwitchRemove: "Remove model switch",
+    modelSwitchBusyHint:
+      "The model switch waits for this turn to finish: the new session continues from this session's record",
     modelSwitchFrom: (prevModel?: string) =>
       prevModel
         ? `Switched model (was ${prevModel}) — continued from the earlier conversation`
@@ -776,10 +870,17 @@ When done, open index.html in a browser and self-test once.`,
     },
     skillsBanner: (names: string[]): string =>
       `Using skill${names.length === 1 ? "" : "s"}: ${names.join(", ")}`,
-    /** Composer "+" extension menu (currently only goal mode; more entries later) and the goal chip. */
+    attachedFilesBanner: (names: string[]): string =>
+      `Attached file${names.length === 1 ? "" : "s"}: ${names.join(", ")}`,
+    /** Composer "+" extension menu (image upload, file attachment, goal mode) and the goal chip. */
     plusMenu: "More input options",
     uploadImage: "Upload image",
     uploadImageDesc: "Attach images to this message",
+    uploadFile: "Upload file",
+    uploadFileDesc: "Saved to the session scratchpad; the model reads them by path",
+    removeFile: "Remove file",
+    attachmentTooLarge: (name: string): string =>
+      `${name} exceeds the 10MB limit and was not attached.`,
     goalMode: "Goal mode",
     goalModeDesc: "Loop until the goal completes",
     goalBudgetLabel: "Token budget",
@@ -792,6 +893,9 @@ When done, open index.html in a browser and self-test once.`,
     goalBudgetSave: "Save budget",
     goalRemove: "Exit goal mode",
     goalRoundBanner: (round: number): string => `Goal · round ${round}`,
+    /** Later rounds collapse the objective's images into this chip (round 1 shows them in full). */
+    goalRoundImages: (count: number): string =>
+      count === 1 ? "1 attached image" : `${count} attached images`,
     goalProgress: (rounds: number, tokens: string): string => `round ${rounds} · tokens ${tokens}`,
     goalStatus: {
       active: "running",
@@ -868,6 +972,11 @@ When done, open index.html in a browser and self-test once.`,
     errorsColKind: "Type",
     errorsColMessage: "Message",
     errorsEmpty: "No errors",
+    /** Detail-table pager: newer/older step back through pages of the same filtered set. */
+    errorsNewer: "Newer",
+    errorsOlder: "Older",
+    errorsPageOf: (page: number, pages: number, total: number) =>
+      `Page ${page} / ${pages} · ${total} total`,
   },
 
   traces: {
@@ -916,12 +1025,19 @@ When done, open index.html in a browser and self-test once.`,
     emptyAgent: "No Benchmarks for this agent",
     caseCount: (n: number): string => `${n} case${n === 1 ? "" : "s"}`,
     trendTitle: (metric: string): string => `${metric} over time`,
+    cases: "Cases",
+    viewCase: "View details",
+    taskMaterials: "Task materials",
+    rubric: "Scoring rubric",
+    agentHidden: "Hidden from Target Agent",
+    caseFileUnavailable: "Case files are unavailable",
     evaluations: "Evaluations",
     noEvaluations: "No evaluations yet",
     summaryLabel: "Summary",
     legendUnlabeled: "unlabeled model",
     colVersion: "Version",
-    colModel: "Model",
+    colModel: "Model ID",
+    colThinkingLevel: "Thinking level",
     colScore: "Score",
     colDuration: "Duration",
     colCase: "Case",
@@ -953,6 +1069,7 @@ When done, open index.html in a browser and self-test once.`,
       unknown_skill: "This skill is not in the library.",
       file_not_found: "This file no longer exists.",
       file_too_large: "The file is too large.",
+      too_many_files: "Too many files attached to one message.",
       payload_too_large: "The request is too large.",
       dir_not_absolute: "The directory must be an absolute path.",
       not_a_dir: "That path is not a directory.",

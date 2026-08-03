@@ -25,6 +25,25 @@ export const INSTALL_CMD = "curl -fsSL https://penguin.ooo/install.sh | sh";
 export const INSTALL_CMD_WINDOWS = "irm https://penguin.ooo/install.ps1 | iex";
 
 /**
+ * Offline install commands, per OS tab of the install switcher. Each Release attaches one
+ * installer bundle per target (see scripts/package-release-bundles.sh) and the same file
+ * serves online and offline installation; the commands show the most common architecture —
+ * the localized hint strings name the alternative archive. Language-neutral, like the
+ * one-liners above.
+ */
+export const OFFLINE_INSTALL_CMDS: Record<"linux" | "macos" | "windows", string> = {
+  linux: `mkdir penguin-install
+tar -xzf penguin-linux-x64.tar.gz -C penguin-install
+./penguin-install/install.sh`,
+  macos: `mkdir penguin-install
+tar -xzf penguin-darwin-arm64.tar.gz -C penguin-install
+./penguin-install/install.sh`,
+  windows: `Expand-Archive penguin-win32-x64.zip -DestinationPath penguin-install
+cd penguin-install
+.\\install.cmd`,
+};
+
+/**
  * Heavy marketing media lives in the sibling `penguin-harness-community` repo rather than
  * in this one, so that assets only the landing site ever renders stay out of the clone of
  * everyone who builds the product. Served by raw.githubusercontent with

@@ -21,7 +21,9 @@ import type {
   ApprovalDecisionRequest,
   AuthLoginRequest,
   AuthResponse,
+  BenchmarkCasesResponse,
   BenchmarksResponse,
+  CaseMaterial,
   DirListResponse,
   FilesStatRequest,
   FilesStatResponse,
@@ -39,6 +41,8 @@ import type {
   PrefsResponse,
   ProjectCreateRequest,
   ProjectCreateResponse,
+  ProjectUpdateRequest,
+  ProjectUpdateResponse,
   ProjectsResponse,
   ScheduleItem,
   SchedulesResponse,
@@ -63,6 +67,7 @@ import type {
   UiPrefs,
   UpdateCheckResponse,
   UpdateRunResponse,
+  UsageErrorsPage,
   UsageGroupBy,
   UsageResponse,
   VaultResponse,
@@ -70,7 +75,7 @@ import type {
   VersionResponse,
   WorkspaceFilesResponse,
 } from "@prismshadow/penguin-server/api";
-import { apiFetch } from "./client";
+import { apiFetch, apiFetchWithMeta } from "./client";
 
 // Auth & user -----------------------------------------------------------------
 
@@ -111,6 +116,13 @@ export const listProjects = () => apiFetch<ProjectsResponse>("/api/projects");
 
 export const createProject = (body: ProjectCreateRequest) =>
   apiFetch<ProjectCreateResponse>("/api/projects", { method: "POST", body });
+
+/** Rename a Project's display name (owner); the id is immutable. */
+export const updateProject = (projectId: string, body: ProjectUpdateRequest) =>
+  apiFetch<ProjectUpdateResponse>(`/api/projects/${encodeURIComponent(projectId)}`, {
+    method: "PATCH",
+    body,
+  });
 
 export const deleteProject = (projectId: string) =>
   apiFetch<void>(`/api/projects/${encodeURIComponent(projectId)}`, { method: "DELETE" });
@@ -209,12 +221,20 @@ export const getAgentTraces = (projectId: string, agentId: string) =>
 export const listSessions = (
   projectId: string,
   agentId: string,
-  opts?: { offset: number; limit: number; category?: SessionCategory; withCounts?: boolean },
+  opts?: {
+    offset: number;
+    limit: number;
+    category?: SessionCategory;
+    withCounts?: boolean;
+    /** Also list CLI-created Sessions (Trace discovery + adoption); default = web rows straight from the DB. */
+    cli?: boolean;
+  },
 ) => {
   const qs = opts
     ? `?limit=${opts.limit}&offset=${opts.offset}` +
       (opts.category ? `&category=${opts.category}` : "") +
-      (opts.withCounts ? "&counts=1" : "")
+      (opts.withCounts ? "&counts=1" : "") +
+      (opts.cli ? "&cli=1" : "")
     : "";
   return apiFetch<SessionsResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}/sessions${qs}`,
@@ -245,8 +265,17 @@ export const patchSession = (sessionId: string, body: SessionPatchRequest) =>
 export const deleteSession = (sessionId: string) =>
   apiFetch<void>(`/api/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
 
+/**
+ * History rebuild. Carries the server's clock at read time (see ApiFetchMeta.serverNowMs)
+ * alongside the messages: a Task still running has no Trace entry for the event currently in
+ * flight, so its elapsed can only be measured by differencing this against the Task's first
+ * message timestamp — both server-side values, so no client clock offset enters the result
+ * (see pushMessages).
+ */
 export const getMessages = (sessionId: string) =>
-  apiFetch<MessagesResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/messages`);
+  apiFetchWithMeta<MessagesResponse>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
+  ).then(({ data, serverNowMs }) => ({ ...data, serverNowMs }));
 
 // Task execution, approval, abort, compaction ------------------------------------------------------
 
@@ -359,6 +388,26 @@ export const importAgentTrace = (projectId: string, agentId: string, body: Trace
   );
 
 // Usage statistics ----------------------------------------------------------------------
+
+/**
+ * One page of the cost center's error table (newest first). The dashboard response already
+ * carries the first page; this is for paging back to earlier ones without refetching the
+ * whole aggregate. Takes the dashboard's date/agent filter only — the model filter never
+ * applied to errors.
+ */
+export const getUsageErrors = (
+  projectId: string,
+  params: { offset: number; limit: number; from?: string; to?: string; agentId?: string },
+) =>
+  apiFetch<UsageErrorsPage>(`/api/projects/${encodeURIComponent(projectId)}/usage/errors`, {
+    query: {
+      offset: String(params.offset),
+      limit: String(params.limit),
+      from: params.from,
+      to: params.to,
+      agentId: params.agentId,
+    },
+  });
 
 export const getUsage = (
   projectId: string,
@@ -491,6 +540,59 @@ export const listBenchmarks = (projectId: string, agentId: string) =>
   apiFetch<BenchmarksResponse>(
     `/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}/benchmarks`,
   );
+
+export const listBenchmarkCases = (projectId: string, agentId: string, benchmarkId: string) =>
+  apiFetch<BenchmarkCasesResponse>(
+    `/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}` +
+      `/benchmarks/${encodeURIComponent(benchmarkId)}/cases`,
+  );
+
+const benchmarkCaseFilesPath = (
+  projectId: string,
+  agentId: string,
+  benchmarkId: string,
+  caseId: string,
+  material: CaseMaterial,
+) =>
+  `/api/projects/${encodeURIComponent(projectId)}/agents/${encodeURIComponent(agentId)}` +
+  `/benchmarks/${encodeURIComponent(benchmarkId)}/cases/${encodeURIComponent(caseId)}` +
+  `${material === "rubric" ? "/rubric" : ""}/files`;
+
+export const listBenchmarkCaseFiles = (
+  projectId: string,
+  agentId: string,
+  benchmarkId: string,
+  caseId: string,
+  path: string,
+  material: CaseMaterial,
+) =>
+  apiFetch<WorkspaceFilesResponse>(
+    benchmarkCaseFilesPath(projectId, agentId, benchmarkId, caseId, material),
+    { query: { path } },
+  );
+
+export const benchmarkCaseFileUrl = (
+  projectId: string,
+  agentId: string,
+  benchmarkId: string,
+  caseId: string,
+  path: string,
+  material: CaseMaterial,
+  options?: { download?: boolean; preview?: boolean },
+): string => {
+  const base = `${benchmarkCaseFilesPath(
+    projectId,
+    agentId,
+    benchmarkId,
+    caseId,
+    material,
+  )}/content?path=${encodeURIComponent(path)}`;
+  return (
+    base +
+    (options?.download ? "&download=1" : "") +
+    (options?.preview && !options.download ? "&preview=1" : "")
+  );
+};
 
 // Agent State snapshot export / import ------------------------------------------------------
 

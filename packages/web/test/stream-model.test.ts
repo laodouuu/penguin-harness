@@ -44,6 +44,7 @@ import {
   pushMessages,
   registerLocalDecision,
 } from "../src/lib/omni/stream-model";
+import { liveSessionElapsedMs } from "../src/lib/omni/task-stats";
 import type {
   AssistantTextItem,
   CompactionItem,
@@ -494,6 +495,67 @@ describe("approvals and events", () => {
     expect((items(m)[2] as ReconnectItem).attempt).toBe(1);
   });
 
+  it("request_end(failed) renders a retry notice too, with its countdown inputs and give-up target", () => {
+    // The engine reconnects on `failed` exactly like timeout/malformed. Without an item there
+    // is no countdown and findLastWaitingReconnect returns null, so "Retry now" / "Give up"
+    // never render either — the session just stalls for up to 7.75s with nothing on screen.
+    const m = createStreamModel();
+    pushMessage(m, requestBegin());
+    pushMessage(
+      m,
+      requestEnd("failed", "Upstream HTTP/2 stream failed (upstream_http2_stream_error)", 4000),
+      111_000,
+    );
+    const retry = items(m)[0] as ReconnectItem;
+    expect(retry).toMatchObject({
+      kind: "reconnect",
+      status: "failed",
+      attempt: 1,
+      retrying: false,
+      plannedDelayMs: 4000, // the countdown
+      arrivedAtMs: 111_000, // its client-clock anchor
+    });
+    // Waiting, so it is the item the retry-now / give-up controls attach to; the retry then
+    // flips it out of the waiting state exactly like the other two statuses.
+    pushMessage(m, requestBegin());
+    expect(retry.retrying).toBe(true);
+  });
+
+  it("a mixed ladder keeps counting: failed no longer resets the attempt number mid-run", () => {
+    // `failed` used to fall through to the reset branch, so timeout → failed → timeout
+    // renumbered the third attempt back to #1 while the engine was on its third.
+    const m = createStreamModel();
+    pushMessage(m, requestBegin());
+    pushMessage(m, requestEnd("timeout"));
+    pushMessage(m, requestBegin());
+    pushMessage(m, requestEnd("failed", "502 bad gateway"));
+    pushMessage(m, requestBegin());
+    pushMessage(m, requestEnd("timeout"));
+    expect((items(m) as ReconnectItem[]).map((i) => [i.status, i.attempt])).toEqual([
+      ["timeout", 1],
+      ["failed", 2],
+      ["timeout", 3],
+    ]);
+    // A normal finish still resets it: the next run's first failure is #1 again.
+    pushMessage(m, requestBegin());
+    pushMessage(m, requestEnd("completed"));
+    pushMessage(m, requestBegin());
+    pushMessage(m, requestEnd("failed"));
+    expect((items(m)[3] as ReconnectItem).attempt).toBe(1);
+  });
+
+  it("request_end(auth) stays out of the ladder: terminal, so no retry notice and the count resets", () => {
+    // The one status the engine does not retry — an item would promise a countdown and a
+    // "Retry now" that will never happen, on top of the composer already being gated.
+    const m = createStreamModel();
+    pushMessage(m, requestBegin());
+    pushMessage(m, requestEnd("timeout"));
+    pushMessage(m, requestBegin());
+    pushMessage(m, requestEnd("auth", "401 invalid x-api-key"));
+    expect((items(m) as ReconnectItem[]).filter((i) => i.kind === "reconnect")).toHaveLength(1);
+    expect(m.reconnectRun).toBe(0);
+  });
+
   it("retries exhausted: an arriving abort marks the waiting retry notice gaveUp and resets the consecutive-failure count", () => {
     const m = createStreamModel();
     pushMessage(m, requestBegin());
@@ -670,7 +732,7 @@ describe("origin nested routing", () => {
       m,
       at(withOrigin(tokenUsage(counts(400), counts(400)), "c1"), "2026-07-05T00:00:02.000Z"),
     );
-    notifyTaskIdle(m, Date.now());
+    notifyTaskIdle(m);
     const stats = items(m).find((i) => i.kind === "task_stats") as TaskStatsItem;
     expect(stats.stats!.tokens).toBe(1400);
     expect(stats.stats!.tokensDelta).toBe(1400);
@@ -726,6 +788,22 @@ describe("Task segmentation and stats triggering", () => {
     expect(stats.stats!.elapsedDeltaMs).toBe(5000); // time span from the first to the last message
   });
 
+  it("aggregates every assistant text segment in a Task into the footer copy target", () => {
+    const m = createStreamModel();
+    pushMessages(m, [
+      at(userText("build it"), "2026-07-05T00:00:00.000Z"),
+      at(assistantText("Creating `package.json`."), "2026-07-05T00:00:01.000Z"),
+      at(tokenUsage(counts(400), counts(400)), "2026-07-05T00:00:02.000Z"),
+      at(assistantText("Installation finished."), "2026-07-05T00:00:03.000Z"),
+      at(tokenUsage(counts(700), counts(300)), "2026-07-05T00:00:04.000Z"),
+    ]);
+
+    finalizeHistory(m);
+
+    const stats = items(m).find((i) => i.kind === "task_stats") as TaskStatsItem;
+    expect(stats.assistantText).toBe("Creating `package.json`.\n\nInstallation finished.");
+  });
+
   it("stream end (finalizeHistory) closes the last Task; rounds without usage get no stats figures but still get a footer", () => {
     const m = createStreamModel();
     pushMessages(m, [
@@ -753,13 +831,15 @@ describe("Task segmentation and stats triggering", () => {
     expect(items(m).filter((i) => i.kind === "task_stats")).toHaveLength(0);
   });
 
-  it("live streams close at task_state:idle, measuring the delta with the local clock", () => {
+  it("live streams close at task_state:idle, measuring the delta from Trace timestamps", () => {
     const m = createStreamModel();
-    pushMessage(m, userText("live question"), 10_000);
-    pushMessage(m, tokenUsage(counts(800), counts(800)), 11_000);
-    notifyTaskIdle(m, 15_100);
+    // The local clock advances 5.1s across this round, but only the message timestamps decide
+    // the settled figure — the same span a reload would replay out of the Trace.
+    pushMessage(m, at(userText("live question"), "2026-07-05T00:00:00.000Z"), 10_000);
+    pushMessage(m, at(tokenUsage(counts(800), counts(800)), "2026-07-05T00:00:01.000Z"), 11_000);
+    notifyTaskIdle(m);
     const stats = items(m).find((i) => i.kind === "task_stats") as TaskStatsItem;
-    expect(stats.stats!.elapsedDeltaMs).toBe(5100);
+    expect(stats.stats!.elapsedDeltaMs).toBe(1_000);
     expect(stats.stats!.tokens).toBe(800);
   });
 
@@ -778,7 +858,7 @@ describe("Task segmentation and stats triggering", () => {
     const m = createStreamModel();
     pushMessage(m, at(userText("one"), "2026-07-05T00:00:00.000Z"));
     pushMessage(m, at(tokenUsage(counts(1000), counts(1000)), "2026-07-05T00:00:01.000Z"));
-    notifyTaskIdle(m, Date.now());
+    notifyTaskIdle(m);
     // Manual /compact (outside the Task boundary).
     pushMessage(
       m,
@@ -789,7 +869,7 @@ describe("Task segmentation and stats triggering", () => {
     // Next Task.
     pushMessage(m, at(userText("two"), "2026-07-05T00:02:00.000Z"));
     pushMessage(m, at(tokenUsage(counts(1800), counts(500)), "2026-07-05T00:02:01.000Z"));
-    notifyTaskIdle(m, Date.now());
+    notifyTaskIdle(m);
     const statsItems = items(m).filter((i) => i.kind === "task_stats") as TaskStatsItem[];
     const last = statsItems[statsItems.length - 1]!;
     expect(last.stats!.tokensDelta).toBe(500); // excludes the compaction's 300
@@ -827,7 +907,7 @@ describe("output TPS (request event pair timing)", () => {
     // happening between the two requests isn't counted).
     pushMessage(m, at(tokenUsage(out(900), out(900)), "2026-07-05T00:00:03.500Z"));
     pushMessage(m, at(requestEnd("completed"), "2026-07-05T00:00:04.000Z"));
-    notifyTaskIdle(m, Date.now());
+    notifyTaskIdle(m);
     const stats = items(m).find((i) => i.kind === "task_stats") as TaskStatsItem;
     expect(stats.stats!.outputTps).toBe(300); // 900 / 3s
     expect(stats.stats!.tokensByBucket).toEqual({ cacheRead: 0, cacheWrite: 0, output: 900 });
@@ -838,7 +918,7 @@ describe("output TPS (request event pair timing)", () => {
     // No request events -> no LLM timing -> TPS is null.
     pushMessage(m, at(userText("q1"), "2026-07-05T00:00:00.000Z"));
     pushMessage(m, at(tokenUsage(out(100), out(100)), "2026-07-05T00:00:01.000Z"));
-    notifyTaskIdle(m, Date.now());
+    notifyTaskIdle(m);
     const s1 = items(m).find((i) => i.kind === "task_stats") as TaskStatsItem;
     expect(s1.stats!.outputTps).toBeNull();
     // Next Task: two request rounds of 2s each, 400 output tokens each -> 800 / 4s = 200 tok/s.
@@ -849,7 +929,7 @@ describe("output TPS (request event pair timing)", () => {
     pushMessage(m, at(requestBegin(), "2026-07-05T00:01:05.000Z"));
     pushMessage(m, at(tokenUsage(out(400), out(400)), "2026-07-05T00:01:06.500Z"));
     pushMessage(m, at(requestEnd("completed"), "2026-07-05T00:01:07.000Z")); // 2s
-    notifyTaskIdle(m, Date.now());
+    notifyTaskIdle(m);
     const stats = items(m).filter((i) => i.kind === "task_stats") as TaskStatsItem[];
     expect(stats[stats.length - 1]!.stats!.outputTps).toBe(200);
   });
@@ -871,7 +951,7 @@ describe("output TPS (request event pair timing)", () => {
     pushMessage(m, at(approvalDecision("allow", "t1"), "2026-07-05T00:00:32.000Z"));
     pushMessage(m, at(tokenUsage(out(1000), out(1000)), "2026-07-05T00:00:32.500Z"));
     pushMessage(m, at(requestEnd("completed"), "2026-07-05T00:00:33.000Z"));
-    notifyTaskIdle(m, Date.now());
+    notifyTaskIdle(m);
     const stats = items(m).find((i) => i.kind === "task_stats") as TaskStatsItem;
     // Wall clock 32s, minus 30s approval -> 2s of generation: 1000 / 2s = 500 tok/s
     // (without subtracting it, it would be only 31 tok/s).
@@ -902,7 +982,7 @@ describe("output TPS (request event pair timing)", () => {
         "2026-07-05T00:00:21.000Z",
       ),
     );
-    notifyTaskIdle(m, Date.now());
+    notifyTaskIdle(m);
     const stats = items(m).find((i) => i.kind === "task_stats") as TaskStatsItem;
     expect(stats.stats!.outputTps).toBe(300); // 600 / 2s (the compaction request's 999 output and 15.5s are excluded)
   });
@@ -1179,9 +1259,122 @@ describe("compaction-internal messages (#17: history rebuild aligned with the li
     // Only the real prompt is a user bubble.
     expect(items(m).filter((i) => i.kind === "user_text")).toHaveLength(1);
   });
+
+  // The server's Trace twin of this case lives in trace-service.test.ts.
+  it("images sent with a steering message join its chip; a later standalone image still starts a Task", () => {
+    // Core delivers a steering message's images as user image messages right behind its text.
+    // They belong to that chip — no bubble of their own and, crucially, no new Task — while an
+    // image arriving with anything in between is an ordinary Prompt again.
+    const m = createStreamModel();
+    pushMessages(m, [
+      at(userText("fix the bug"), "2026-07-05T00:00:00.000Z"),
+      at(assistantText("looking"), "2026-07-05T00:00:02.000Z"),
+      at(userText("[user_steering]\nlike this mock\n[/user_steering]"), "2026-07-05T00:00:04.000Z"),
+      at(imageUrlMessage("data:image/png;base64,AAAA"), "2026-07-05T00:00:04.100Z"),
+      // A subagent message belongs to another session's stream: it routes away before the
+      // window is touched, so the image after it still joins the chip (the server matches).
+      at(withOrigin(assistantText("child thinking"), "child1"), "2026-07-05T00:00:04.150Z"),
+      at(imageUrlMessage("data:image/png;base64,BBBB"), "2026-07-05T00:00:04.200Z"),
+      at(assistantText("matching the mock"), "2026-07-05T00:00:06.000Z"),
+      at(tokenUsage(counts(200), counts(100)), "2026-07-05T00:00:07.000Z"),
+      // A new Prompt that is nothing but an image: a Task of its own.
+      at(imageUrlMessage("data:image/png;base64,CCCC"), "2026-07-05T00:00:20.000Z"),
+      at(assistantText("on it"), "2026-07-05T00:00:22.000Z"),
+    ]);
+    finalizeHistory(m);
+    // The subagent gets its own card, but no `user_image` bubble appears before the last one:
+    // both of the steering message's images went into the chip across it.
+    expect(items(m).map((i) => i.kind)).toEqual([
+      "user_text",
+      "assistant_text",
+      "user_steering",
+      "subagent",
+      "assistant_text",
+      "task_stats",
+      "user_image",
+      "assistant_text",
+      "task_stats",
+    ]);
+    const steering = items(m).find((i) => i.kind === "user_steering") as UserSteeringItem;
+    expect(steering.text).toBe("like this mock");
+    expect(steering.images).toEqual(["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]);
+  });
+
+  it("an images-only steering message keeps an empty chip text (the images are the message)", () => {
+    const m = createStreamModel();
+    pushMessages(m, [
+      at(userText("fix the bug"), "2026-07-05T00:00:00.000Z"),
+      at(assistantText("looking"), "2026-07-05T00:00:02.000Z"),
+      at(userText("[user_steering]\n\n[/user_steering]"), "2026-07-05T00:00:04.000Z"),
+      at(imageUrlMessage("data:image/png;base64,AAAA"), "2026-07-05T00:00:04.100Z"),
+      at(assistantText("got it"), "2026-07-05T00:00:06.000Z"),
+    ]);
+    finalizeHistory(m);
+    const steering = items(m).find((i) => i.kind === "user_steering") as UserSteeringItem;
+    expect(steering.text).toBe("");
+    expect(steering.images).toEqual(["data:image/png;base64,AAAA"]);
+    expect(items(m).filter((i) => i.kind === "user_image")).toHaveLength(0);
+  });
 });
 
-describe("live close-out elapsed (#5/#20: mid-join takes the message-timestamp lower bound)", () => {
+describe("elapsed comes from Trace timestamps (#5/#20: settled spans, reload-stable live anchor)", () => {
+  it("reloading mid-run resumes the header's live elapsed instead of restarting it", () => {
+    const m = createStreamModel();
+    const loadNow = 1_000_000;
+    // The Task started 60s ago and is STILL running — nothing finalizes it, so the header
+    // renders sessionElapsedMs + (now − taskStartLocalMs). Every message in a rebuild is fed
+    // the same `nowMs`, so without the re-anchor that addend would be 0 and the chip would
+    // drop back to the settled total and climb from zero on every reload.
+    pushMessages(
+      m,
+      [
+        at(userText("long-running task"), "2026-07-05T00:00:00.000Z"),
+        at(assistantText("working"), "2026-07-05T00:01:00.000Z"),
+      ],
+      loadNow,
+    );
+    expect(m.taskOpen).toBe(true);
+    expect(loadNow - m.taskStartLocalMs).toBe(60_000);
+    // No `Date` header came back, so the Trace's own span decides the anchor. Note the local
+    // clock here is nowhere near the server timestamps, and the figure is unaffected: only
+    // differences between server-side values ever reach it.
+    expect(liveSessionElapsedMs(m.stats, m.taskOpen, m.taskStartLocalMs, loadNow + 5000)).toBe(
+      65_000,
+    );
+  });
+
+  it("a reload while an event is still in flight counts it, from the server's own clock", () => {
+    // A tool started executing 10s into the Task and is STILL running 300s later. Nothing has
+    // been appended to the Trace since it began, so its span reaches only those first 10s —
+    // the server's clock at read time is the only thing that sees the other 290s.
+    const replay = [
+      at(userText("run the build"), "2026-07-05T00:00:00.000Z"),
+      at(toolCall({ name: "bash", arguments: "{}", toolCallId: "t1" }), "2026-07-05T00:00:10.000Z"),
+    ];
+    const serverNow = Date.parse("2026-07-05T00:05:00.000Z");
+    // The client's clock is deliberately nothing like the server's: a 90-minute offset that must
+    // not reach the figure, since both ends of the measured interval are server-side values.
+    const loadNow = serverNow + 90 * 60_000;
+    const m = createStreamModel();
+    pushMessages(m, replay, loadNow, serverNow);
+    expect(m.taskOpen).toBe(true);
+    expect(liveSessionElapsedMs(m.stats, m.taskOpen, m.taskStartLocalMs, loadNow)).toBe(300_000);
+    // Without the header the Trace's span is the floor: short, but never an overshoot.
+    const noHeader = createStreamModel();
+    pushMessages(noHeader, replay, loadNow, null);
+    expect(
+      liveSessionElapsedMs(noHeader.stats, noHeader.taskOpen, noHeader.taskStartLocalMs, loadNow),
+    ).toBe(10_000);
+  });
+
+  it("a live stream is unaffected: the anchor stays the real Task start", () => {
+    const m = createStreamModel();
+    // One message at a time with the real current clock — the Trace span is still 0 when the
+    // Task opens, so the re-anchor is a no-op and must not shift the origin.
+    pushMessage(m, at(userText("live question"), "2026-07-05T00:00:00.000Z"), 10_000);
+    expect(m.taskStartLocalMs).toBe(10_000);
+  });
+
   it("a Task ending right after a refresh: elapsed takes the message-timestamp span, not the local-clock delta", () => {
     const m = createStreamModel();
     const loadNow = 1_000_000;
@@ -1196,19 +1389,31 @@ describe("live close-out elapsed (#5/#20: mid-join takes the message-timestamp l
       loadNow,
     );
     // task_state:idle arrives 2s after joining.
-    notifyTaskIdle(m, loadNow + 2000);
+    notifyTaskIdle(m);
     const stats = items(m).find((i) => i.kind === "task_stats") as TaskStatsItem;
     expect(stats.stats!.elapsedDeltaMs).toBe(60_000);
     expect(stats.stats!.elapsedMs).toBe(60_000); // sessionElapsedMs is corrected in sync
   });
 
-  it("when the local-clock delta is larger (normal live stream), the local clock still wins", () => {
-    const m = createStreamModel();
-    pushMessage(m, at(userText("live question"), "2026-07-05T00:00:00.000Z"), 10_000);
-    pushMessage(m, at(tokenUsage(counts(800), counts(800)), "2026-07-05T00:00:01.000Z"), 11_000);
-    notifyTaskIdle(m, 15_100);
-    const stats = items(m).find((i) => i.kind === "task_stats") as TaskStatsItem;
-    expect(stats.stats!.elapsedDeltaMs).toBe(5100);
+  it("a degenerate round settles to the same figure live and replayed — the local clock never leaks in", () => {
+    // No request_end anywhere (interrupted before its first Request ran), which used to be the
+    // one case that fell back to the local clock. Watching it live and replaying it out of the
+    // Trace must now agree, or the header would silently change on reload.
+    const msgs = [
+      at(userText("live question"), "2026-07-05T00:00:00.000Z"),
+      at(tokenUsage(counts(800), counts(800)), "2026-07-05T00:00:01.000Z"),
+    ];
+    const live = createStreamModel();
+    pushMessage(live, msgs[0]!, 10_000);
+    pushMessage(live, msgs[1]!, 11_000);
+    notifyTaskIdle(live); // idle detected 4.1s later by the local clock — irrelevant now
+    const replayed = createStreamModel();
+    pushMessages(replayed, msgs, 9_000_000); // reloaded much later, different clock entirely
+    finalizeHistory(replayed);
+    const of = (m: StreamModel) =>
+      (items(m).find((i) => i.kind === "task_stats") as TaskStatsItem).stats!.elapsedDeltaMs;
+    expect(of(live)).toBe(1_000);
+    expect(of(replayed)).toBe(of(live));
   });
 });
 
@@ -1374,7 +1579,7 @@ describe("thinking/tool durations (collapsed-row display data)", () => {
     const m = createStreamModel();
     pushMessage(m, at(userText("Q"), T0));
     pushMessage(m, at(toolCall({ name: "x", arguments: "{}", toolCallId: "tb" }), T1));
-    notifyTaskIdle(m, Date.parse(T2));
+    notifyTaskIdle(m);
     const card = items(m).find((i) => i.kind === "tool_call") as ToolCallItem;
     expect(card.outputComplete).toBe(true);
     expect(card.outputStopReason).toBe("aborted");
@@ -1472,5 +1677,100 @@ describe("multiple calls with a repeated tool_call_id (fallback for legacy Trace
     expect(cards[0]!.outputComplete).toBe(true);
     expect(cards[0]!.outputStopReason).toBe("aborted");
     expect(cards[1]!.outputComplete).toBe(false); // new card waits for output as normal
+  });
+});
+
+describe("fidelity-only messages render nothing (empty assistant bubble after thinking)", () => {
+  // Core emits a complete text/thinking message with an empty body when a provider attaches an
+  // opaque payload to an otherwise empty part (Gemini's thoughtSignature on a text part, GPT-5's
+  // encrypted-reasoning phase markers) — see flushText / flushThinking. It must exist so the
+  // fidelity round-trips into history; it must not become a visible item.
+  it("an empty assistant text after thinking adds no item", () => {
+    const m = createStreamModel();
+    pushMessage(m, userText("hi"));
+    pushMessage(m, thinkingMessage("pondering"));
+    pushMessage(m, assistantText(""));
+    expect(items(m).map((i) => i.kind)).toEqual(["user_text", "thinking"]);
+  });
+
+  it("a whitespace-only body counts as empty too", () => {
+    const m = createStreamModel();
+    pushMessage(m, assistantText("\n  \n"));
+    pushMessage(m, thinkingMessage("   "));
+    expect(items(m)).toEqual([]);
+  });
+
+  it("real content is unaffected, including a lone space inside real text", () => {
+    const m = createStreamModel();
+    pushMessage(m, thinkingMessage("thought"));
+    pushMessage(m, assistantText("answer"));
+    expect(items(m).map((i) => i.kind)).toEqual(["thinking", "assistant_text"]);
+    expect((items(m)[1] as AssistantTextItem).text).toBe("answer");
+  });
+
+  it("a streamed segment is still settled by its complete message, not dropped", () => {
+    // The guard must only skip the append path — a fragment that streamed real content is
+    // replaced by its complete message as before.
+    const m = createStreamModel();
+    pushMessage(m, partialText("start", "Hel"));
+    pushMessage(m, partialText("delta", "lo"));
+    pushMessage(m, partialText("stop"));
+    pushMessage(m, assistantText("Hello"));
+    const texts = items(m).filter((i) => i.kind === "assistant_text");
+    expect(texts).toHaveLength(1);
+    expect((texts[0] as AssistantTextItem).text).toBe("Hello");
+    expect((texts[0] as AssistantTextItem).streaming).toBe(false);
+  });
+
+  // A blank body can also arrive through a fragment: core starts a text segment on the first
+  // truthy delta (`if (!item.text) break;`), and "\n\n" is truthy, so a whitespace-only segment
+  // really does stream. Guarding only the append path would leave live and after-refresh
+  // disagreeing — the fragment kept a blank bubble that a reload then dropped.
+  it("a blank streamed text segment is discarded, so live matches the history rebuild", () => {
+    const live = createStreamModel();
+    pushMessage(live, thinkingMessage("pondering"));
+    pushMessage(live, partialText("start", "\n\n"));
+    pushMessage(live, partialText("stop"));
+    pushMessage(live, assistantText("\n\n"));
+
+    const history = createStreamModel();
+    pushMessage(history, thinkingMessage("pondering"));
+    pushMessage(history, assistantText("\n\n"));
+
+    expect(items(live).map((i) => i.kind)).toEqual(["thinking"]);
+    expect(items(live).map((i) => i.kind)).toEqual(items(history).map((i) => i.kind));
+  });
+
+  it("a blank streamed thinking segment is discarded too", () => {
+    const live = createStreamModel();
+    pushMessage(live, partialThinking("start", "  "));
+    pushMessage(live, partialThinking("stop"));
+    pushMessage(live, thinkingMessage("  "));
+
+    const history = createStreamModel();
+    pushMessage(history, thinkingMessage("  "));
+
+    expect(items(live)).toEqual([]);
+    expect(items(history)).toEqual([]);
+  });
+
+  it("discarding a blank fragment clears the open-fragment slots, leaving no stuck spinner", () => {
+    // The fragment must be removed rather than blanked: a leftover openText would keep
+    // `streaming: true` forever (a permanent blinking cursor), and a stale pendingText would
+    // let the next complete message replace the wrong item.
+    const m = createStreamModel();
+    pushMessage(m, partialText("start", " "));
+    pushMessage(m, partialText("stop"));
+    pushMessage(m, assistantText(" "));
+    expect(items(m)).toEqual([]);
+
+    // The next real reply must append cleanly, not resurrect the discarded fragment.
+    pushMessage(m, partialText("start", "Hi"));
+    pushMessage(m, partialText("stop"));
+    pushMessage(m, assistantText("Hi"));
+    const texts = items(m).filter((i) => i.kind === "assistant_text");
+    expect(texts).toHaveLength(1);
+    expect((texts[0] as AssistantTextItem).text).toBe("Hi");
+    expect((texts[0] as AssistantTextItem).streaming).toBe(false);
   });
 });

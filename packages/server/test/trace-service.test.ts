@@ -20,6 +20,7 @@ import {
   toolCall,
   toolCallOutput,
   userText,
+  withOrigin,
 } from "@prismshadow/penguin-core";
 import type { OmniMessage, SessionMetaPayload, TokenCounts } from "@prismshadow/penguin-core";
 import { TraceService } from "../src/services/trace-service.js";
@@ -378,6 +379,52 @@ describe("trace-service", () => {
     expect(a.elapsedMs).toBe(4_100);
   });
 
+  it("a failed request the engine retries stays inside the same turn (it is a reconnect, not a turn end)", async () => {
+    // The engine reconnects on `failed` as well as timeout/malformed, so the resent Request
+    // belongs to the same user turn. If segmentation still keyed on timeout/malformed only,
+    // one gateway blip would split a single turn's Tokens, duration and TPS across two Tasks
+    // and inflate the Task count — the same smearing the timeout rule exists to prevent.
+    await writeTraceFile(root, P, A, "2026-07-05", S, 1, [
+      at("2026-07-05T10:00:00.000Z", sessionMeta(metaPayload())),
+      at("2026-07-05T10:00:00.000Z", userText("question one")),
+      at("2026-07-05T10:00:01.000Z", requestBegin()),
+      at("2026-07-05T10:00:02.000Z", requestEnd("failed")), // a gateway error → the engine reconnects
+      at("2026-07-05T10:00:03.000Z", requestBegin()),
+      at("2026-07-05T10:00:05.000Z", requestEnd("completed")),
+      at("2026-07-05T10:00:05.100Z", tokenUsage(counts(1000), buckets(0, 900, 100))),
+    ]);
+    const a = await service.analyze(P, A, S, 1);
+    expect(a.requests.map((r) => r.taskIndex)).toEqual([0, 0]); // one turn, two Requests
+    expect(a.tasks.map((t) => t.taskIndex)).toEqual([0]);
+    expect(a.reconnectCount).toBe(1);
+    expect(a.tasks[0]!.tokens.output).toBe(100);
+  });
+
+  it("a failed compaction request is NOT a reconnect: compaction fails fast on it", async () => {
+    // Segmentation has to track the engine loop by loop: the turn loop retries `failed`, the
+    // compaction loop deliberately does not (it keeps the old context and tries again on the
+    // next trigger). Counting this as a reconnect would invent an attempt that never happened.
+    await writeTraceFile(root, P, A, "2026-07-05", S, 1, [
+      at("2026-07-05T10:00:00.000Z", sessionMeta(metaPayload())),
+      at("2026-07-05T10:00:00.000Z", userText("question one")),
+      at("2026-07-05T10:00:01.000Z", requestBegin()),
+      at("2026-07-05T10:00:02.000Z", requestEnd("completed")),
+      at("2026-07-05T10:00:02.100Z", tokenUsage(counts(1000), buckets(0, 900, 100))),
+      at(
+        "2026-07-05T10:00:03.000Z",
+        compactionBegin({ reason: "context", mode: "summarize", context: 1000, turns: 1 }),
+      ),
+      at("2026-07-05T10:00:04.000Z", requestBegin()),
+      at("2026-07-05T10:00:05.000Z", requestEnd("failed")), // compaction gives up here
+      at(
+        "2026-07-05T10:00:06.000Z",
+        compactionEnd({ reason: "context", mode: "summarize", status: "failed" }),
+      ),
+    ]);
+    const a = await service.analyze(P, A, S, 1);
+    expect(a.reconnectCount).toBe(0);
+  });
+
   it("after the previous turn ends in timeout (retries exhausted), a new user message starts a new turn", async () => {
     // "timeout → continuation" holds only for **automatic retries within the
     // same run**. Once retries are exhausted and the engine gives up, a message
@@ -613,6 +660,38 @@ describe("trace-service", () => {
     const a = await service.analyze(P, A, S, 12);
     expect(a.requests.map((r) => r.taskIndex)).toEqual([0, 0, 0, 1]);
     expect(a.modelSegments.map((s) => s.taskIndex)).toEqual([0, 0, 0, 1]);
+  });
+
+  // The Web's live-stream twin of this case lives in stream-model.test.ts.
+  it("Task grouping: images sent with a steering message don't start a Task either (a Prompt's do)", async () => {
+    const T = (sec: string) => `2026-07-05T10:04:${sec}Z`;
+    await writeTraceFile(root, P, A, "2026-07-05", S, 13, [
+      sessionMeta(metaPayload()),
+      // Task 0: a normal turn that calls a tool.
+      at(T("00.000"), userText("q1")),
+      at(T("01.000"), requestBegin()),
+      at(T("02.000"), toolCall({ name: "read_file", arguments: "{}", toolCallId: "t1" })),
+      at(T("02.500"), requestEnd("completed")),
+      at(T("03.000"), toolCallOutput({ output: "o", toolCallId: "t1" })),
+      // Steering with two images: core delivers them right behind the text, and the whole
+      // batch stays inside Task 0 — an image is a turn starter everywhere except here.
+      at(T("03.200"), userText("[user_steering]\nlike this mock\n[/user_steering]")),
+      at(T("03.300"), imageUrlMessage("data:image/png;base64,AAAA")),
+      // A subagent message belongs to another session's stream and says nothing about this
+      // one's grouping, so it leaves the window open (the Web skips these even earlier).
+      at(T("03.350"), withOrigin(assistantText("child thinking"), "child-1")),
+      at(T("03.400"), imageUrlMessage("data:image/png;base64,BBBB")),
+      at(T("03.500"), requestBegin()),
+      at(T("04.000"), assistantText("answer 1")),
+      at(T("04.500"), requestEnd("completed")),
+      // An images-only Prompt after all that is a genuine new turn.
+      at(T("20.000"), imageUrlMessage("data:image/png;base64,CCCC")),
+      at(T("21.000"), requestBegin()),
+      at(T("22.000"), assistantText("answer 2")),
+      at(T("22.500"), requestEnd("completed")),
+    ]);
+    const a = await service.analyze(P, A, S, 13);
+    expect(a.requests.map((r) => r.taskIndex)).toEqual([0, 0, 1]);
   });
 
   // Compaction is its own turn: the previous turn called a tool and would

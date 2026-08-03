@@ -49,14 +49,16 @@ import { useSessions } from "../../state/sessions";
 import { AgentAvatar } from "../../components/ui/agent-avatar";
 import { Chevron } from "../../components/ui/chevron";
 import { Dropdown } from "../../components/ui/dropdown";
+import { noAutofill } from "../../components/ui/input";
 import { PenguinLogo } from "../../components/ui/penguin-logo";
 import { toastError } from "../../components/ui/toast";
 import { useVersionInfo } from "../../lib/use-version-info";
 import { ChatInput } from "./chat-input";
 import { buildSkillsMessage } from "./skill-use";
+import { EXAMPLE_FOLDERS } from "./example-tasks";
+import type { ExampleFolderId, ExampleTask, ExampleTaskId } from "./example-tasks";
 import { clearDraft, draftKey, loadDraft, saveDraft } from "./draft-cache";
 import type { DraftCache } from "./draft-cache";
-import { handoffMessage } from "./agent-mentions";
 import { sameModelRef } from "../models/model-grouping";
 
 /** Coalescing window for writing body text to the cache: keystrokes are frequent, so a short batch accumulates before persisting (option changes are still written immediately). */
@@ -89,16 +91,22 @@ function saveAppliedRouteKey(field: RouteStateField, key: string): void {
 }
 
 /**
- * Example tasks on the draft screen, in display order (game card first, LoL music player,
- * then the RAG build). Copy lives in S.chat.exampleTasks[id]; skills are pinned via a
- * `[use_skills]` block — only those the selected Agent actually has installed are included,
- * so the block never references a skill the agent can't read.
+ * One glyph per example folder, 16×16. Icons live on the folder rather than on each example:
+ * with the examples reduced to single-line titles, a column of per-row icons was noise
+ * competing with the titles, while the folder row is exactly where a glyph earns its place —
+ * it is what you scan to pick a category.
+ *
+ * webapps: a browser window (chrome bar + two dots). agents: the SAME robot head the sidebar's
+ * Agents entry uses (NAV_ICONS.agents) — deliberately not a generic refresh loop, because the
+ * app already has one glyph that means "agent" and a folder of agent examples should wear it.
+ * Duplicated as a literal rather than imported: sidebar.tsx imports from chat-page.tsx, which
+ * renders this file, so importing it back would close an import cycle.
  */
-const EXAMPLE_TASKS: { id: "game" | "lol" | "rag"; skills: string[] }[] = [
-  { id: "game", skills: ["web-design"] },
-  { id: "lol", skills: ["web-design"] },
-  { id: "rag", skills: ["penguin-sdk", "web-design"] },
-];
+const FOLDER_GLYPHS: Record<ExampleFolderId, string> = {
+  webapps:
+    "M3 6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6zM3 9h18M6 6.5h.01M9 6.5h.01",
+  agents: "M12 3v3m-6 4a6 6 0 0 1 12 0v5a3 3 0 0 1-3 3H9a3 3 0 0 1-3-3v-5zm3 3h.01M15 13h.01",
+};
 
 export function DraftView({
   projectId,
@@ -134,10 +142,6 @@ export function DraftView({
     cached.approvalMode ?? "allow-all",
   );
   const [modelRef, setModelRef] = useState<ModelRefDto | null>(cached.modelRef ?? null);
-  /** @-handoff target (chip): draft content just like the body text, cached alongside it (fed in via the ChatInput callback). */
-  const [handoffAgentId, setHandoffAgentId] = useState<string | null>(
-    cached.handoffAgentId ?? null,
-  );
   const textRef = useRef(cached.text ?? "");
   /**
    * Selected skills (prefilled by "quick invoke" from the Skills page + checked in
@@ -300,19 +304,9 @@ export function DraftView({
     const data: DraftCache = { text: textRef.current, workspace, approvalMode };
     if (agentId) data.agentId = agentId;
     if (modelRef) data.modelRef = modelRef;
-    if (handoffAgentId) data.handoffAgentId = handoffAgentId;
     if (skillsRef.current.length > 0) data.skills = skillsRef.current;
     saveDraft(draftKey(userId, projectId), data);
-  }, [
-    cancelPendingSave,
-    userId,
-    projectId,
-    agentId,
-    workspace,
-    approvalMode,
-    modelRef,
-    handoffAgentId,
-  ]);
+  }, [cancelPendingSave, userId, projectId, agentId, workspace, approvalMode, modelRef]);
 
   // The timer and unmount cleanup read persistNow via a ref to always get the **latest version**: a stale closure would write back outdated options.
   const persistRef = useRef(persistNow);
@@ -373,8 +367,8 @@ export function DraftView({
     setCurrentAgentId(a.agentId);
   };
 
-  // One in-flight guard shared by every send entry point (composer send / example task /
-  // @-handoff): a second submission while one is running would create a second Session with
+  // One in-flight guard shared by both send entry points (composer send / example task): a
+  // second submission while one is running would create a second Session with
   // its own first task and a racing navigation. The ref is the synchronous guard; the state
   // drives disabled styling on the example button (the composer has its own busy state).
   const sendingRef = useRef(false);
@@ -429,9 +423,9 @@ export function DraftView({
   // busy id drives the clicked card's spinner; the shared in-flight guard and all failure
   // handling live in onSend). keepDraft: an example never consumes the composer text, so a
   // typed-but-unsent draft must survive. The selected model / Workspace / approval mode apply as-is.
-  const [exampleBusy, setExampleBusy] = useState<"game" | "lol" | "rag" | null>(null);
+  const [exampleBusy, setExampleBusy] = useState<ExampleTaskId | null>(null);
   const runExample = useCallback(
-    async (task: (typeof EXAMPLE_TASKS)[number]) => {
+    async (task: ExampleTask) => {
       if (exampleBusy !== null) return;
       setExampleBusy(task.id);
       try {
@@ -447,45 +441,16 @@ export function DraftView({
     [exampleBusy, agentSkills, onSend],
   );
 
-  // @ handoff: opens a new chat for the @-mentioned agent (approval mode carries over from the
-  // draft's current value; model/Workspace use the creation defaults), first input =
-  // [handoff_from] source block + the text and images with the @ mention stripped.
+  /**
+   * The open example folder — bookmark-style, and ALWAYS exactly one: selecting another closes
+   * the previous, and clicking the open one is a no-op rather than collapsing it. Never
+   * nullable on purpose. With every folder the same length, "one open" is what makes the
+   * block's height a constant: the examples area can neither collapse to bare folder rows nor
+   * grow, so nothing below it shifts as folders are switched.
+   */
+  const [openFolder, setOpenFolder] = useState<ExampleFolderId>(EXAMPLE_FOLDERS[0].id);
+
   const selectedAgent = agents.find((a) => a.agentId === agentId) ?? null;
-  const onHandoff = useCallback(
-    async (target: AgentSummary, input: TaskInputPart[]): Promise<boolean> => {
-      if (!selectedAgent || sendingRef.current) return false;
-      sendingRef.current = true;
-      setSending(true);
-      const origin: TaskInputPart = {
-        type: "text",
-        text: handoffMessage({
-          agentId: selectedAgent.agentId,
-          ...(selectedAgent.name !== undefined ? { agentName: selectedAgent.name } : {}),
-        }),
-      };
-      let createdId: string | null = null;
-      try {
-        const created = await api.createSession(projectId, target.agentId, { approvalMode });
-        createdId = created.session.sessionId;
-        const res = await api.postTask(createdId, { input: [origin, ...input] });
-        add(created.session);
-        discardDraft();
-        navigate(`/chat/${res.sessionId}`);
-        return true;
-      } catch (e) {
-        if (createdId) void api.deleteSession(createdId).catch(() => undefined);
-        // The new chat uses the project's default model (createSession doesn't specify a model reference), so the error copy's model context follows suit.
-        toastError(
-          apiErrorText(e, models?.defaultModel ? { modelId: models.defaultModel.modelId } : {}),
-        );
-        return false;
-      } finally {
-        sendingRef.current = false;
-        setSending(false);
-      }
-    },
-    [projectId, selectedAgent, approvalMode, add, discardDraft, navigate, models],
-  );
 
   // Capability info for the currently selected model (vision/context window) switches instantly with the selection (matched by paired reference).
   const modelInfo = models?.models.find((m) => sameModelRef(m, modelRef));
@@ -539,14 +504,12 @@ export function DraftView({
           modeSaving={false}
           autoFocus
           agents={agents}
+          {...(agentId ? { currentAgentId: agentId } : {})}
           skills={agentSkills}
           {...(cached.skills && cached.skills.length > 0 ? { initialSkills: cached.skills } : {})}
           onSkillsChange={onSkillsChange}
-          onHandoff={onHandoff}
           initialText={cached.text ?? ""}
           onTextChange={onTextChange}
-          {...(cached.handoffAgentId ? { initialHandoffTargetId: cached.handoffAgentId } : {})}
-          onHandoffTargetChange={setHandoffAgentId}
         />
 
         {/* Ownership selection right below the card (small pill dropdowns, styled after ChatGPT's project picker button) */}
@@ -555,113 +518,89 @@ export function DraftView({
           <WorkspaceSelect projectId={projectId} workspace={workspace} onChange={setWorkspace} />
         </div>
 
-        {/* Example tasks: one-click canned builds showing off the one-sentence → app flow,
-            stacked vertically in display order on every viewport. Disabled until
-            agents/models/skills are resolved (onSend would silently no-op without an Agent);
-            hover only darkens the border, per the card convention. */}
-        <div className="mt-6 flex flex-col items-stretch gap-2">
-          {EXAMPLE_TASKS.map((task) => {
-            const copy = S.chat.exampleTasks[task.id];
+        {/* Example tasks: one-click canned builds showing off the one-sentence → app flow.
+            Bookmark-style folders with ALWAYS exactly one open — selecting another closes the
+            previous, and the open one cannot be collapsed. The block is therefore a FIXED
+            height: two folder rows plus one folder's rows, whichever folder that is (they are
+            kept the same length). Nothing below shifts when folders are switched, and no
+            scroll container is needed — a scrollbar inside a six-line showcase reads as a
+            defect. Each example is a single-line title; its one-sentence description rides in
+            the row tooltip rather than a second line. Rows are disabled until
+            agents/models/skills are resolved (onSend would silently no-op without an Agent). */}
+        <div className="mt-6 space-y-1">
+          {EXAMPLE_FOLDERS.map((folder) => {
+            const open = folder.id === openFolder;
             return (
-              <button
-                key={task.id}
-                type="button"
-                disabled={exampleBusy !== null || sending || !skillsLoaded || !agentId || !models}
-                onClick={() => void runExample(task)}
-                className="group flex min-w-0 items-center gap-3 rounded-xl border border-gray-200 bg-white px-4 py-3 text-left transition-colors duration-150 hover:border-gray-300 disabled:cursor-default disabled:opacity-60 dark:border-gray-800 dark:bg-gray-900 dark:hover:border-gray-700"
-              >
-                {/* 24×24 line icons (gamepad / music note / sparkle), consistent with the icon convention */}
-                {task.id === "lol" ? (
-                  <svg
-                    width="20"
-                    height="20"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    className="shrink-0 text-brand-500 dark:text-brand-400"
-                    aria-hidden
-                  >
-                    <path
-                      d="M9 18V6l11-2v12"
+              <div key={folder.id}>
+                {/* A tab, not a disclosure: the open folder stays open (clicking it is a
+                    no-op) and carries the selected fill, so the block always shows one
+                    folder's examples and its height never changes. */}
+                <button
+                  type="button"
+                  aria-expanded={open}
+                  onClick={() => setOpenFolder(folder.id)}
+                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left transition-colors duration-150 ${
+                    open
+                      ? "bg-gray-100 dark:bg-gray-800/70"
+                      : "hover:bg-gray-100 dark:hover:bg-gray-800/70"
+                  }`}
+                >
+                  <span className="shrink-0 text-brand-500 dark:text-brand-400">
+                    <svg
+                      width="16"
+                      height="16"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
                       strokeWidth="1.7"
                       strokeLinecap="round"
                       strokeLinejoin="round"
-                    />
-                    <circle cx="6.5" cy="18" r="2.5" strokeWidth="1.7" />
-                    <circle cx="17.5" cy="16" r="2.5" strokeWidth="1.7" />
-                  </svg>
-                ) : task.id === "game" ? (
-                  <svg
-                    width="20"
-                    height="20"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    className="shrink-0 text-brand-500 dark:text-brand-400"
-                    aria-hidden
-                  >
-                    <path
-                      d="M6.7 6h10.6a4 4 0 0 1 3.97 3.56c.2 1.8.73 5.05.73 6.44a3 3 0 0 1-3 3c-1 0-1.5-.5-2-1l-1.4-1.4a2 2 0 0 0-1.42-.6H9.82a2 2 0 0 0-1.41.6L7 18c-.5.5-1 1-2 1a3 3 0 0 1-3-3c0-1.39.52-4.64.73-6.44A4 4 0 0 1 6.7 6z"
-                      strokeWidth="1.7"
-                      strokeLinejoin="round"
-                    />
-                    <path
-                      d="M6.5 11h4M8.5 9v4M15 12h.01M18 10h.01"
-                      strokeWidth="1.7"
-                      strokeLinecap="round"
-                    />
-                  </svg>
-                ) : (
-                  <svg
-                    width="20"
-                    height="20"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    className="shrink-0 text-brand-500 dark:text-brand-400"
-                    aria-hidden
-                  >
-                    <path
-                      d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"
-                      strokeWidth="1.7"
-                      strokeLinejoin="round"
-                    />
-                    <path
-                      d="M18.5 15.5l.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1z"
-                      strokeWidth="1.4"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
-                )}
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-medium text-gray-900 dark:text-gray-100">
-                    {copy.label}
+                      aria-hidden
+                    >
+                      <path d={FOLDER_GLYPHS[folder.id]} />
+                    </svg>
                   </span>
-                  <span className="line-clamp-2 text-xs text-gray-500 dark:text-gray-400">
-                    {copy.desc}
+                  <span className="min-w-0 flex-1 truncate text-sm font-medium text-gray-700 dark:text-gray-300">
+                    {S.chat.exampleFolders[folder.id]}
                   </span>
-                </span>
-                {exampleBusy === task.id ? (
-                  <span className="ml-1 shrink-0 text-xs text-gray-400">{S.common.loading}</span>
-                ) : (
-                  <svg
-                    width="16"
-                    height="16"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    className="ml-1 shrink-0 text-gray-300 transition-colors duration-150 group-hover:text-gray-500 dark:text-gray-600 dark:group-hover:text-gray-400"
-                    aria-hidden
-                  >
-                    <path
-                      d="M5 12h14M13 6l6 6-6 6"
-                      strokeWidth="1.7"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                    />
-                  </svg>
+                  <span className="shrink-0 text-xs text-gray-400 dark:text-gray-500">
+                    {folder.tasks.length}
+                  </span>
+                  <Chevron open={open} size={14} className="text-gray-400" />
+                </button>
+
+                {open && (
+                  <ul className="mt-0.5 space-y-0.5 pl-4">
+                    {folder.tasks.map((task) => {
+                      const copy = S.chat.exampleTasks[task.id];
+                      return (
+                        <li key={task.id}>
+                          <button
+                            type="button"
+                            title={copy.desc}
+                            disabled={
+                              exampleBusy !== null ||
+                              sending ||
+                              !skillsLoaded ||
+                              !agentId ||
+                              !models
+                            }
+                            onClick={() => void runExample(task)}
+                            className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm text-gray-600 transition-colors duration-150 hover:bg-gray-100 hover:text-gray-900 disabled:cursor-default disabled:opacity-60 disabled:hover:bg-transparent dark:text-gray-400 dark:hover:bg-gray-800/70 dark:hover:text-gray-200"
+                          >
+                            <span className="min-w-0 flex-1 truncate">{copy.label}</span>
+                            {exampleBusy === task.id && (
+                              <span className="shrink-0 text-xs text-gray-400">
+                                {S.common.loading}
+                              </span>
+                            )}
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
                 )}
-              </button>
+              </div>
             );
           })}
         </div>
@@ -675,22 +614,22 @@ export function DraftView({
 
 /**
  * Superscript "new version" pill on the version line (accent-colored, raised via
- * align-super). Kept literally identical to the sidebar footer's copy in
- * components/layout/sidebar.tsx — the two surfaces must not drift apart.
+ * align-super). The only remaining copy: the sidebar's version row dropped its badge when
+ * the three update rows collapsed into one whose label already names the new version.
  */
 const versionBadgeClass =
   "ml-1.5 inline-block rounded-full bg-[var(--accent-bg)] px-1.5 align-super text-[10px] font-medium leading-4 text-[var(--accent-fg)] transition-opacity duration-150 hover:opacity-80";
 
 /**
- * Quiet version line under the brand subtitle: `vX.Y.Z · 最近更新日期 7 月 26 日` /
- * `… · Last updated Jul 26`. The product name is not repeated here — the brand wordmark
+ * Quiet version line under the brand subtitle: `vX.Y.Z · Last updated Jul 26`
+ * (localized per dictionary). The product name is not repeated here — the brand wordmark
  * sits directly above, and the sidebar's version footer is bare `vX.Y.Z` too. The date is
  * the running version's release
  * date, stamped into core's BUILD_DATE at build time — displayed as-is, no network;
  * dev builds and releases that predate the stamping (v0.1.2 and earlier) carry null
  * and show the version alone. When the update check knows a newer release, a small
- * superscript badge follows, linking to the release page (this surface's existing
- * affordance; the sidebar's badge additionally offers admins the update dialog).
+ * superscript badge follows, linking to the release page (this surface's affordance; the
+ * sidebar user menu instead routes its single update row into the update dialog).
  * Fetching starts on mount — useVersionInfo caches at module level, so after the first
  * resolution anywhere in the app this renders instantly and never refetches. Nothing
  * renders until the version resolves (no placeholder flicker under the brand).
@@ -967,6 +906,7 @@ function WorkspaceSelect({
               value={pathDraft}
               placeholder="…"
               aria-label={S.chat.workspace}
+              {...noAutofill}
               onChange={(e) => setPathDraft(e.target.value)}
               onBlur={() => void commitPathEdit()}
               onKeyDown={(e) => {

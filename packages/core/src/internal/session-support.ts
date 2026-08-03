@@ -11,8 +11,9 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { formatLocalDate } from "./dates.js";
 import { sessionShell } from "../environment/tools/command/shell.js";
 import type { SessionEnvironmentValues } from "../state/agent-state.js";
+import { modelVisiblePath } from "./model-visible-path.js";
 import { workspacesDir } from "../state/index.js";
-import { userText } from "../omnimessage/index.js";
+import { attachedImageLine, isWholeOriginBlock, userText } from "../omnimessage/index.js";
 import type { OmniMessage } from "../omnimessage/index.js";
 
 /** Session runtime environment fields: the placeholder substitution values for `assembleSystemPrompt`; producer and consumer share the same type. */
@@ -41,9 +42,11 @@ export function sessionEnvironment(
 ): SessionEnvironment {
   return {
     sessionId,
-    cwd: workspaceDir,
+    // Model-visible spelling (forward slashes on Windows): the model composes tool arguments
+    // and shell commands from these two lines, so they must be safe in both contexts.
+    cwd: modelVisiblePath(workspaceDir),
     agentId: ids.agentId,
-    projectDir: ids.projectDir,
+    projectDir: modelVisiblePath(ids.projectDir),
     provider: ids.provider,
     modelId: ids.modelId,
     platform: process.platform,
@@ -103,6 +106,14 @@ export async function createTempWorkspace(
   );
 }
 
+/**
+ * Stands in for a single image that could not be turned into a path line — a data URL that
+ * doesn't parse. Shown to the model and the user instead of silently dropping the attachment.
+ * A scratchpad that can't be written to is a different matter: the fold throws and the run
+ * ends, rather than carrying on without what the sender attached.
+ */
+const IMAGE_DROPPED_NOTE = "[an attached image could not be saved and was dropped]";
+
 /** Maps a data URL's mime type to a file extension on disk; unknown mimes use bin (the image-reading tool sniffs the magic bytes and doesn't rely on the extension). */
 const MIME_TO_EXT: Record<string, string> = {
   "image/png": "png",
@@ -110,6 +121,9 @@ const MIME_TO_EXT: Record<string, string> = {
   "image/gif": "gif",
   "image/webp": "webp",
 };
+
+/** An input image message — what both conversions below pull out of the input. */
+const isImage = (m: OmniMessage): boolean => (m.payload as { type?: string }).type === "image_url";
 
 /**
  * Input conversion for when the session model doesn't support images: image messages
@@ -126,8 +140,6 @@ export async function imagesToScratchpadPaths(
   input: OmniMessage[],
   dir: string,
 ): Promise<OmniMessage[]> {
-  const isImage = (m: OmniMessage): boolean =>
-    (m.payload as { type?: string }).type === "image_url";
   if (!input.some(isImage)) return input;
 
   const lines: string[] = [];
@@ -135,12 +147,12 @@ export async function imagesToScratchpadPaths(
     if (!isImage(msg)) continue;
     const url = (msg.payload as { image_url?: string }).image_url ?? "";
     if (/^https?:\/\//i.test(url)) {
-      lines.push(`[attached image: ${url}]`);
+      lines.push(attachedImageLine(url));
       continue;
     }
     const match = /^data:([^;,]+);base64,(.+)$/s.exec(url);
     if (!match) {
-      lines.push("[an attached image could not be saved and was dropped]");
+      lines.push(IMAGE_DROPPED_NOTE);
       continue;
     }
     await fs.mkdir(dir, { recursive: true });
@@ -158,18 +170,44 @@ export async function imagesToScratchpadPaths(
         if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       }
     }
-    lines.push(`[attached image: ${file}]`);
+    lines.push(attachedImageLine(modelVisiblePath(file)));
   }
 
-  // Concatenation: the path lines are appended after the last user text message; if the input is images only, add a plain path-only text message.
-  const rest = input.filter((m) => !isImage(m));
+  return appendAttachmentLines(
+    input.filter((m) => !isImage(m)),
+    lines,
+  );
+}
+
+/**
+ * Concatenation rule shared by every attachment-line producer (see the markers module's
+ * attachment-lines.ts): the lines are appended as one block after the **last user text
+ * message**; if the input carries no such message (attachments only), they become a plain
+ * line-only text message of their own.
+ *
+ * "User text" here excludes a message that is entirely a whole-message origin block —
+ * `[handoff_from]` / `[model_switch_from]` (isWholeOriginBlock). Those parsers only recognize
+ * the block when it IS the whole message, so appending to one would turn a one-line banner
+ * back into a raw marker in a user bubble. The Web composer reaches exactly that shape when a
+ * message carries attachments, no text, and a staged handoff: its only text message is the
+ * origin block. Such input therefore falls through to the line-only message, leaving the block
+ * intact. Prefix blocks (`[use_skills]`, `[scheduled_task]`) are parsed at index 0 and keep
+ * their own body, so they still take the lines as usual.
+ *
+ * Exported from the package barrel because the server writes `[attached file: …]` lines for
+ * the composer's uploads and must place them exactly the same way — one rule, so a message
+ * carrying both kinds of attachment still reads as a single trailing block.
+ * Returns `input` unchanged when there are no lines to append.
+ */
+export function appendAttachmentLines(input: OmniMessage[], lines: string[]): OmniMessage[] {
+  if (lines.length === 0) return input;
   const suffix = lines.join("\n");
-  const lastTextIdx = rest.findLastIndex((m) => {
-    const p = m.payload as { type?: string; role?: string };
-    return p.type === "text" && p.role === "user";
+  const lastTextIdx = input.findLastIndex((m) => {
+    const p = m.payload as { type?: string; role?: string; text?: string };
+    return p.type === "text" && p.role === "user" && !isWholeOriginBlock(p.text ?? "");
   });
-  if (lastTextIdx === -1) return [...rest, userText(suffix)];
-  return rest.map((m, i) => {
+  if (lastTextIdx === -1) return [...input, userText(suffix)];
+  return input.map((m, i) => {
     if (i !== lastTextIdx) return m;
     const p = m.payload as { type: string; role: string; text: string };
     return { ...m, payload: { ...p, text: `${p.text}\n\n${suffix}` } } as OmniMessage;

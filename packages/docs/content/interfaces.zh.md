@@ -62,9 +62,9 @@ interface LLMOutcome {
 | `completed` | 正常完成(已产出 token_usage) | 继续下一步 |
 | `timeout` | 超时/传输层断连/瞬时的供应商额度错误 | 同一 run 内自动重连 |
 | `malformed` | 响应解析失败 | 同一 run 内自动重连 |
+| `failed` | 分类器未判定为瞬时的错误(参数等) | 同样在同一 run 内自动重连——状态本身仍如实上报为 `failed` |
 | `aborted` | 用户中断 | 停止交还用户 |
-| `failed` | 参数等不可重试错误 | 停止交还用户 |
-| `auth` | 凭据被拒绝 | 与 `failed` 同样停止；宿主据此禁用输入，直到该模型的 API key 被更新 |
+| `auth` | 凭据被拒绝 | 停止交还用户——唯一从不重试的 LLM 终态；宿主据此禁用输入，直到该模型的 API key 被更新 |
 
 实现约束：从不抛异常；不做内部重试(重连是引擎的职责，见 [Agent 运行循环](/agent-loop))。
 
@@ -110,7 +110,7 @@ interface EnvironmentInterface {
 }
 ```
 
-`executeTool` 逐条产出 `partial_tool_call_output`，并以恰好一条完整 `tool_call_output` 收尾；带 `origin` 的嵌套消息(如 `run_subagent` 转发的子 Session 消息)原样透传。渲染不是本接口的职责——流式渲染由 CLI / Web 前端完成。
+`executeTool` 逐条产出 `partial_tool_call_output`，并以恰好一条完整 `tool_call_output` 收尾；带 `origin` 的嵌套消息(如 `run_subagent` 转发的子 Session 消息)原样透传。内置 Environment 可以把被截断文本保存在 Session scratchpad 中，无需在此公共接口暴露存储生命周期钩子。其模型可见 recovery 路径是普通绝对路径；Windows 上统一写成正斜杠——Node 的 fs API 与包内 (Git) Bash 工具 Shell 都接受这种写法，同一拼写既可直接作 `read_file` 参数、也可用于 Shell 命令。渲染不是本接口的职责——流式渲染由 CLI / Web 前端完成。
 
 ### ToolExecutionRequest 与 EnvironmentConfig
 
@@ -124,6 +124,7 @@ interface ToolExecutionRequest {
 interface EnvironmentConfig {
   workspaceDir: string;
   toolConfig: ToolConfig;                   // { customTools: ToolDefinitionConfig[]; mcpServers: MCPServerConfig[] }
+  sessionScratchpadDir?: string;            // 本 Session 的 scratchpad（scratchpad/<sessionId>），提供后启用截断输出恢复
   services?: EnvironmentServices;           // 注入给个别工具的运行时服务
   vault?: Record<string, string>;           // Vault 环境变量,注入 exec_command / input_command 子进程
 }
@@ -139,6 +140,17 @@ interface MCPServerConfig {
   name: string;
   config: Record<string, unknown>;
 }
+```
+
+`Agent.createSession()` 与 `resumeSession()` 会自动传入 Session scratchpad 目录。自行管理稳定
+per-Session 目录的独立 embedder 只需提供该目录即可启用，不暴露归档专用类型：
+
+```ts
+const environment = new Environment({
+  workspaceDir,
+  toolConfig,
+  sessionScratchpadDir, // 例如 <dataRoot>/<project>/agents/<agent>/scratchpad/<sessionId>
+});
 ```
 
 ### 内层工具契约：BuiltinTool

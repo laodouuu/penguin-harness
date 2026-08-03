@@ -22,8 +22,8 @@
  *     token_usage counts toward this level's stats (same convention as the CLI).
  *   - Events: approval_decision annotates the corresponding tool card
  *     (labeled "manual" if clicked on this end, "automatic" otherwise);
- *     abort → an interruption marker item; request_end ending in
- *     timeout/malformed → a retry-hint item (the engine discards that
+ *     abort → an interruption marker item; request_end ending in any status
+ *     the engine reconnects on (failed/timeout/malformed) → a retry-hint item (the engine discards that
  *     attempt and resends the original input; the next request_begin marks the hint as resent, and an
  *     arriving abort marks it as retries exhausted); other request_begin/end
  *     events aren't rendered (Request duration is covered by Trace
@@ -39,9 +39,9 @@
  *     session's user side starts a new Task; a Task ends when the live
  *     stream receives task_state:idle (notifyTaskIdle), or — during history
  *     rebuild — when the next Task starts / the stream ends
- *     (finalizeHistory). Live finalization takes the duration as the larger
- *     of the local-clock delta and the message-timestamp span (the local
- *     clock only covers the time since a mid-stream join). A stats row is only added if token_usage occurred during the Task.
+ *     (finalizeHistory). Either way the duration comes from Trace timestamps
+ *     alone and never the local clock, so a round settles to the same figure
+ *     watched live and replayed after a reload. A stats row is only added if token_usage occurred during the Task.
  *   - Overlap-dedup helpers: buildDedupIndex/isDuplicate
  *     judge duplicates by exact match of the envelope JSON; when a complete
  *     message hits the dedup check, discardFragmentFor also discards the corresponding in-flight fragment.
@@ -101,6 +101,14 @@ export interface UserSteeringItem {
   kind: "user_steering";
   id: number;
   text: string;
+  /**
+   * Images sent with this steering message: core delivers them as ordinary user image
+   * messages right behind the text, and they are folded in here rather than rendered as
+   * standalone bubbles — they are part of the same message and must not start a Task.
+   * (Without vision the images arrive as `[attached image: …]` lines inside `text` instead,
+   * which the chip restores at render time like any user message.)
+   */
+  images?: string[];
   /** Message timestamp (milliseconds): shown on footer hover. */
   atMs?: number;
 }
@@ -195,12 +203,23 @@ export interface AbortItem {
   reason?: string;
 }
 
-/** An LLM Request ending in timeout/malformed → the engine retries carrying the content already produced. */
+/**
+ * The statuses the engine reconnects on — every LLM failure except `auth`, which is terminal
+ * (see core's TURN_RETRY_STATUSES). A retry the user cannot see is a stalled session with no
+ * explanation and no way out, so all three render the same countdown and the same controls.
+ */
+export type ReconnectStatus = "failed" | "timeout" | "malformed";
+
+function isReconnectStatus(status: StopReason | undefined): status is ReconnectStatus {
+  return status === "failed" || status === "timeout" || status === "malformed";
+}
+
+/** An LLM Request ending in failed/timeout/malformed → the engine retries carrying the content already produced. */
 export interface ReconnectItem {
   kind: "reconnect";
   id: number;
-  /** Trigger reason: timeout (timed out / disconnected) or malformed (an incomplete or unparseable response). */
-  status: "timeout" | "malformed";
+  /** Trigger reason: timeout (timed out / disconnected), malformed (an incomplete or unparseable response), or failed (the provider returned an error). */
+  status: ReconnectStatus;
   /** Which retry attempt this is (increments on consecutive failures within the same round; resets to 1 after a request finishes normally). */
   attempt: number;
   /** The retry request has been sent (set true by the next request_begin). */
@@ -317,6 +336,13 @@ export interface StreamModel {
   /** A fragment that has stopped and is waiting to be replaced by the complete message. */
   pendingText: AssistantTextItem | null;
   pendingThinking: ThinkingItem | null;
+  /**
+   * The steering chip still collecting its images: core delivers a steering message's images
+   * as user image messages immediately behind its text, so an image arriving while this is
+   * set belongs to that chip. Any other message closes the window (see pushMessage) — an
+   * images-only Prompt sent after a steering message is a genuine new Task.
+   */
+  openSteering: UserSteeringItem | null;
   /** tool_call_id → tool card (shared by both fragment attribution and complete-message replacement). */
   toolCards: Map<string, ToolCallItem>;
   /** Direct child Session id → nested model. */
@@ -349,7 +375,7 @@ export interface StreamModel {
    * dispatches it via `void executeOne`, which doesn't block the streaming loop — execution happens between two Requests).
    */
   openApprovalWaitMs: number;
-  /** Consecutive reconnect-failure count (incremented when request_end is timeout/malformed, reset to zero on any other terminal status). */
+  /** Consecutive reconnect-failure count (incremented when request_end carries a status the engine reconnects on, reset to zero on any other terminal status). */
   reconnectRun: number;
   /**
    * Timestamp (ms) of the most recent auth failure: a main-session `request_end` with
@@ -367,13 +393,30 @@ export interface StreamModel {
   lastAuthFailureMs: number | null;
   /** Task segmentation state. */
   taskOpen: boolean;
+  /**
+   * Local-clock instant the running Task's header elapsed ticks from — display
+   * only; no settled duration is ever derived from it (see finalizeOpenTask,
+   * which reads Trace timestamps alone). A live stream sets it to the real
+   * start; a history rebuild would otherwise stamp the page-load instant and
+   * restart the ticking value from zero on every reload, so pushMessages
+   * back-dates it by the elapsed already behind the Task — measured entirely
+   * in server time, so no client/server clock offset reaches it, and taken
+   * from the server's own clock rather than the Trace's tail so that an event
+   * still in flight is counted too.
+   */
   taskStartLocalMs: number;
+  /** The Task's first message timestamp, in SERVER time: both the settled duration and the back-dated live anchor measure from it. */
   taskFirstTsMs: number;
   /**
-   * The latest timestamp seen among this round's messages, used only as a
-   * **fallback for the round's end**: only used for a degenerate round that
-   * has no request_end at all (interrupted before its first Request even
-   * ran). The normal round-end is taken from taskLastReqEndMs.
+   * The latest timestamp seen among this round's messages. Two readers:
+   *   - the **fallback for the round's end**, used only for a degenerate
+   *     round that has no request_end at all (interrupted before its first
+   *     Request even ran) — the normal round-end is taken from taskLastReqEndMs;
+   *   - the floor under the anchor pushMessages back-dates taskStartLocalMs
+   *     to, for a round still open when a history rebuild ends. That reader
+   *     fires for every such round, degenerate or not, but only decides the
+   *     anchor when the server's own clock did not come back with the
+   *     response — it cannot see an event still in flight.
    */
   taskLastTsMs: number;
   /**
@@ -407,6 +450,7 @@ function newModel(nested: boolean, localDecisions: Set<string>): StreamModel {
     openThinking: null,
     pendingText: null,
     pendingThinking: null,
+    openSteering: null,
     toolCards: new Map(),
     subagents: new Map(),
     localDecisions,
@@ -466,6 +510,13 @@ export function pushMessage(
     routeNested(model, msg, nowMs);
     return;
   }
+  // A steering message's images arrive as user image messages directly behind its text, with
+  // nothing interleaved (core delivers the batch in one go) — so anything else on this session
+  // closes the collection window opened by the chip (see openSteering). Subagent messages
+  // returned above never reach here, so they leave the window alone.
+  // The server answers the same "what is one Task" question over the Trace — see
+  // `steeringImages` in server/src/services/trace-service.ts; the two need to stay in step.
+  if (!isCompleteUserImage(msg)) model.openSteering = null;
   if (msg.type === "model_msg") {
     // Internal messages within a compaction range (between begin and end)
     // (the compaction prompt, summary output): never rendered, never
@@ -509,6 +560,11 @@ export function pushMessage(
     if (p.source !== undefined) meta.source = p.source;
     model.meta = meta;
   }
+}
+
+/** Whether the message is a complete user image — the only kind that can join an open steering chip. */
+function isCompleteUserImage(msg: OmniMessage): boolean {
+  return msg.type === "model_msg" && (msg.payload as { type?: string }).type === "image_url";
 }
 
 /**
@@ -555,22 +611,55 @@ function advanceLastTs(model: StreamModel, timestamp: string): void {
   if (Number.isFinite(ms)) model.lastTsMs = ms;
 }
 
+/**
+ * Replay a history rebuild. `serverNowMs` is the server's clock when it produced the
+ * response (see StreamControllerDeps.loadMessages); null when unavailable.
+ */
 export function pushMessages(
   model: StreamModel,
   messages: OmniMessage[],
   nowMs: number = Date.now(),
+  serverNowMs: number | null = null,
 ): void {
   for (const msg of messages) pushMessage(model, msg, nowMs);
+  // Re-anchor a Task still open at the end of the replay. Every message in a
+  // rebuild is fed the same `nowMs`, so startTask stamped taskStartLocalMs
+  // with the instant the page loaded — and the header's live elapsed, which
+  // ticks over `now − taskStartLocalMs`, would restart from zero on every
+  // reload of a running Session. Back-date the anchor by the elapsed already
+  // behind this Task, so the ticking value resumes where it left off:
+  //
+  //   now − anchor  ==  (now − loadInstant) + elapsedSoFar
+  //
+  // elapsedSoFar is measured in SERVER time and applied to the local clock, so
+  // a client/server clock offset cancels out and never enters the result. Two
+  // readings of it, the larger winning:
+  //   - serverNowMs − taskFirstTsMs: the true elapsed, and the only one that
+  //     covers an event still in flight — a tool executing, a Request
+  //     streaming, a compaction running — where nothing has been appended to
+  //     the Trace since it began. Whole-second precision (the `Date` header's
+  //     format), which a chip ticking in whole seconds cannot show.
+  //   - taskLastTsMs − taskFirstTsMs: the span the Trace itself proves. The
+  //     fallback when no `Date` header came back, and a floor under a stale
+  //     one: a cached or intermediary-rewritten reading can only be older
+  //     than the true now, so it can under-report but never overshoot.
+  // A live stream pushes one message at a time with the real current clock,
+  // where both readings are still zero at startTask and this is a no-op.
+  if (model.taskOpen) {
+    const tracedSpan = model.taskLastTsMs - model.taskFirstTsMs;
+    const serverSpan = serverNowMs === null ? 0 : serverNowMs - model.taskFirstTsMs;
+    model.taskStartLocalMs = nowMs - Math.max(0, tracedSpan, serverSpan);
+  }
 }
 
-/** The live stream received task_state:idle: finalize the current Task using the local clock. */
-export function notifyTaskIdle(model: StreamModel, nowMs: number = Date.now()): void {
-  finalizeOpenTask(model, "live", nowMs);
+/** The live stream received task_state:idle: finalize the current Task from its Trace timestamps. */
+export function notifyTaskIdle(model: StreamModel): void {
+  finalizeOpenTask(model);
 }
 
 /** History rebuild is complete (end of stream): finalize the last Task using message timestamps. */
 export function finalizeHistory(model: StreamModel): void {
-  finalizeOpenTask(model, "history");
+  finalizeOpenTask(model);
 }
 
 /** Register an approval clicked on this end (so the subsequent approval_decision event is labeled "manual"). */
@@ -609,12 +698,15 @@ export function findToolCard(
 // ---------------------------------------------------------------------------
 
 /**
- * Advance this round's "latest timestamp seen among its messages" — used
- * only as a **fallback for the round's end** (see taskLastReqEndMs). The
- * normal round-end is set by request_end; this only guarantees a usable
- * upper bound for a degenerate round with no request_end at all
- * (interrupted before its first Request even ran). Compaction forms its
- * own round, and messages within its range don't belong to this round, so this isn't advanced for them.
+ * Advance this round's "latest timestamp seen among its messages" — the
+ * **fallback for the round's end** (see taskLastReqEndMs: the normal
+ * round-end is set by request_end, and this only guarantees a usable
+ * upper bound for a degenerate round with no request_end at all,
+ * interrupted before its first Request even ran), and the floor under the
+ * live anchor back-dated on a history rebuild when the server's own clock
+ * did not come back with the response (see taskLastTsMs, pushMessages).
+ * Compaction forms its own round, and messages within its range don't
+ * belong to this round, so this isn't advanced for them.
  */
 function touchTask(model: StreamModel, timestamp: string): void {
   if (!model.taskOpen) return;
@@ -626,7 +718,7 @@ function touchTask(model: StreamModel, timestamp: string): void {
 
 function startTask(model: StreamModel, timestamp: string, nowMs: number): void {
   // The previous Task is finalized by "the next Task starting" (the history-rebuild convention).
-  finalizeOpenTask(model, "history");
+  finalizeOpenTask(model);
   // Finalize any retry state left over from the previous Task: when the
   // server dies during a backoff window, the Trace's tail is
   // request_end(timeout) with no abort, and history rebuild would leave a
@@ -648,7 +740,7 @@ function startTask(model: StreamModel, timestamp: string, nowMs: number): void {
   resetTaskCounters(model.stats);
 }
 
-function finalizeOpenTask(model: StreamModel, mode: "history" | "live", nowMs?: number): void {
+function finalizeOpenTask(model: StreamModel): void {
   if (!model.taskOpen) return;
   model.taskOpen = false;
   // No more tool output will arrive once a Task is finalized: close cards still "executing" and stop their LiveDuration.
@@ -661,23 +753,18 @@ function finalizeOpenTask(model: StreamModel, mode: "history" | "live", nowMs?: 
   // and is naturally excluded — no compaction wall-clock addition/subtraction
   // is needed at all, and history rebuild and live share the same
   // convention, consistent before and after a refresh (see taskLastReqEndMs).
+  //
+  // Trace timestamps are the ONLY source here — the local clock is never
+  // consulted, so a round settles to the same number whether it was watched
+  // live or replayed from the Trace after a reload. A degenerate round (no
+  // request_end at all, e.g. interrupted before its first Request even ran)
+  // falls back to its message span, which the abort event's own timestamp
+  // still bounds; that span is what a later reload would compute, so taking
+  // the local clock instead — as this did before — only bought a number that
+  // silently changed on refresh, along with idle-detection and mid-join
+  // latency folded into it.
   const endMs = model.taskLastReqEndMs ?? model.taskLastTsMs;
-  const tsElapsed = Math.max(0, endMs - model.taskFirstTsMs);
-  // Only a degenerate round (no request_end at all for the whole round,
-  // e.g. interrupted before its first Request even ran) falls back to the
-  // local clock: during a mid-stream join / resync rebuild, the local clock
-  // only covers the time since joining, so it's compared against the
-  // message span and the larger is taken to avoid underestimating. When
-  // there is a request_end, it's the accurate round-end and is used
-  // directly (not compared against the local clock, to avoid folding in noise like idle-detection latency).
-  let elapsed: number;
-  if (model.taskLastReqEndMs !== null) {
-    elapsed = tsElapsed;
-  } else if (mode === "live") {
-    elapsed = Math.max((nowMs ?? Date.now()) - model.taskStartLocalMs, tsElapsed);
-  } else {
-    elapsed = tsElapsed;
-  }
+  const elapsed = Math.max(0, endMs - model.taskFirstTsMs);
   const stats = endTask(model.stats, elapsed);
   if (model.nested) return;
   const reply = collectTaskAssistant(model);
@@ -872,12 +959,15 @@ function handleComplete(
         if (steering !== null) {
           touchTask(model, timestamp);
           const steerMs = tsOf(timestamp);
-          model.items.push({
+          const item: UserSteeringItem = {
             kind: "user_steering",
             id: nextId(model),
             text: steering,
             ...(steerMs !== undefined ? { atMs: steerMs } : {}),
-          });
+          };
+          model.items.push(item);
+          // Open the window for the images core delivers right behind this text.
+          model.openSteering = item;
           return;
         }
         // A complete text message on the main session's user side: starts a new Task.
@@ -895,6 +985,17 @@ function handleComplete(
       // The complete message usually follows right after a fragment's stop: prefer replacing an already-closed pending fragment, then a still-open one.
       const target = model.pendingText ?? model.openText;
       if (target) {
+        // A blank body discards the fragment instead of settling it (same fidelity-only case as
+        // below — core starts a text segment on the first *truthy* delta, so a whitespace-only
+        // segment does stream). Blanking it in place would leave the live view showing an empty
+        // bubble that a reload then drops. Removing the item and clearing both slots is what
+        // discardFragmentFor does for the dedup path, and it leaves no fragment stuck streaming.
+        if (!p.text.trim()) {
+          removeItem(model, target);
+          if (target === model.openText) model.openText = null;
+          model.pendingText = null;
+          return;
+        }
         // The complete message replaces the fragment's content (this guarantees consistency).
         target.text = p.text;
         target.streaming = false;
@@ -905,6 +1006,17 @@ function handleComplete(
         model.pendingText = null;
         return;
       }
+      // Fidelity-only message: core emits a complete text/thinking message with an empty body
+      // when the provider attached an opaque payload to an otherwise empty part — on this text
+      // branch a Gemini thoughtSignature or a GPT-5 `fidelity.phase` segment marker (GPT-5's
+      // encrypted reasoning rides the *thinking* branch instead) — which is why the blank bubble
+      // showed up right after a thinking segment. The message has to exist so the fidelity
+      // round-trips into history, but it has nothing to show, and usually no fragment was opened
+      // for it either (core only starts a segment once a truthy delta arrives). Rendering it
+      // produced a blank "assistant:" bubble; collectTaskAssistant already skipped these when
+      // gathering the reply text, and with the blank-fragment discard above both the live and the
+      // history path now agree with it.
+      if (!p.text.trim()) return;
       // No open fragment (history / mid-stream join): append directly.
       const doneMs = tsOf(timestamp);
       const item: AssistantTextItem = {
@@ -919,6 +1031,13 @@ function handleComplete(
       return;
     }
     case "image_url": {
+      // An image belonging to the steering message just rendered: it joins that chip and
+      // leaves the running Task alone — unlike a Prompt's image, it starts nothing.
+      if (model.openSteering) {
+        touchTask(model, timestamp);
+        model.openSteering.images = [...(model.openSteering.images ?? []), p.image_url];
+        return;
+      }
       startTask(model, timestamp, nowMs);
       const imgMs = tsOf(timestamp);
       model.items.push({
@@ -934,6 +1053,13 @@ function handleComplete(
       const tsMs = tsOf(timestamp);
       const target = model.pendingThinking ?? model.openThinking;
       if (target) {
+        // Blank body: discard the fragment rather than settle it (see the text branch).
+        if (!p.thinking.trim()) {
+          removeItem(model, target);
+          if (target === model.openThinking) model.openThinking = null;
+          model.pendingThinking = null;
+          return;
+        }
         target.thinking = p.thinking;
         target.streaming = false;
         if (p.stop_reason !== undefined) target.stopReason = p.stop_reason;
@@ -942,6 +1068,9 @@ function handleComplete(
         model.pendingThinking = null;
         return;
       }
+      // Same fidelity-only case as the text branch above (GPT-5 encrypted reasoning): the
+      // message carries the payload, not a thought to show.
+      if (!p.thinking.trim()) return;
       const item: ThinkingItem = {
         kind: "thinking",
         id: nextId(model),
@@ -1230,9 +1359,9 @@ function handleEvent(model: StreamModel, p: EventPayload, tsMs?: number, nowMs?:
       return;
     }
     case "request_end": {
-      // timeout/malformed: the engine retries carrying the content already
-      // produced, rendering a retry hint (with the attempt number); other
-      // terminal statuses aren't rendered (Request duration is covered by Trace performance
+      // failed/timeout/malformed: the engine retries carrying the content already
+      // produced, rendering a retry hint (with the attempt number); the terminal
+      // statuses aren't rendered (Request duration is covered by Trace performance
       // analysis) and reset the consecutive-failure count. request events
       // within a compaction range (only visible during history rebuild)
       // are neither rendered nor counted — the compaction process only exposes the compaction event pair to the Human.
@@ -1270,7 +1399,11 @@ function handleEvent(model: StreamModel, p: EventPayload, tsMs?: number, nowMs?:
       // round, so the pending compaction usage never reaches this step and is discarded at finalization (not counted into this round).
       if (tsMs !== undefined) model.taskLastReqEndMs = tsMs;
       commitPendingCompaction(model.stats);
-      if (p.status === "timeout" || p.status === "malformed") {
+      // Every status the engine reconnects on gets an item, `failed` included: it is retried
+      // exactly like the other two, so leaving it out would stall the session for the whole
+      // ladder with nothing on screen and no give-up control. It would also reset the counter
+      // mid-ladder, renumbering a mixed timeout → failed → timeout run back to retry #1.
+      if (isReconnectStatus(p.status)) {
         model.reconnectRun += 1;
         const item: ReconnectItem = {
           kind: "reconnect",

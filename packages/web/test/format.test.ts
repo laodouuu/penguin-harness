@@ -12,11 +12,20 @@ import {
   formatPercent,
   formatRelativeDate,
   formatRelativeDays,
+  formatScore,
   formatTps,
   humanizeDuration,
   humanizeTokens,
   signedDelta,
 } from "../src/lib/format";
+
+describe("formatScore", () => {
+  it("keeps up to the stored two decimal places", () => {
+    expect(formatScore(72)).toBe("72");
+    expect(formatScore(72.5)).toBe("72.5");
+    expect(formatScore(72.35)).toBe("72.35");
+  });
+});
 
 describe("humanizeTokens", () => {
   it("below 1000 unchanged", () => {
@@ -56,6 +65,22 @@ describe("humanizeDuration", () => {
     expect(humanizeDuration(1700, { compact: true })).toBe("1.7s");
     expect(humanizeDuration(820, { compact: true })).toBe("820ms");
     expect(humanizeDuration(63000, { compact: true })).toBe("1m3s");
+  });
+
+  it("a seconds remainder that rounds to 60 carries into the minute", () => {
+    // Rounding the remainder against floored minutes would read 1m60s / 59m60s.
+    expect(humanizeDuration(119_500)).toBe("2m0s");
+    expect(humanizeDuration(119_700)).toBe("2m0s");
+    expect(humanizeDuration(179_600)).toBe("3m0s");
+    expect(humanizeDuration(3_599_700)).toBe("60m0s");
+    // Below the carry the remainder still rounds normally.
+    expect(humanizeDuration(119_400)).toBe("1m59s");
+  });
+
+  it("compact promotes a sub-minute value that rounds to 60s into the minute form", () => {
+    expect(humanizeDuration(59_600, { compact: true })).toBe("1m0s");
+    // Without compact the tenths are kept, so there is nothing to carry.
+    expect(humanizeDuration(59_600)).toBe("59.6s");
   });
 });
 
@@ -138,6 +163,14 @@ describe("formatBytes", () => {
     expect(formatBytes(812)).toBe("812B");
     expect(formatBytes(3481)).toBe("3.4KB");
     expect(formatBytes(2 * 1024 * 1024)).toBe("2MB");
+  });
+
+  it("a value that rounds up to 1024 carries into the next unit", () => {
+    // Picking the unit from the raw value would print 1024KB / 1024MB.
+    expect(formatBytes(1024 * 1024 - 6)).toBe("1MB");
+    expect(formatBytes(1024 * 1024 * 1024 - 800)).toBe("1GB");
+    // Just below the carry the unit is unchanged.
+    expect(formatBytes(1024 * 1024 - 60)).toBe("1023.9KB");
   });
 });
 

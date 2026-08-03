@@ -20,10 +20,11 @@ import {
   thinkingMessage,
   toolCall,
   toolCallOutput,
+  userSteeringText,
   userText,
   withOrigin,
 } from "@prismshadow/penguin-core";
-import type { ApproveFn, OmniMessage } from "@prismshadow/penguin-core";
+import type { ApproveFn, OmniMessage, TextPayload } from "@prismshadow/penguin-core";
 import { openDatabase } from "../src/db/database.js";
 import { HttpError } from "../src/http/errors.js";
 import { SessionsRepo } from "../src/db/repos/sessions.js";
@@ -51,7 +52,7 @@ const ROW: SessionRow = {
 };
 
 /** A simple, scriptable fake Session: run yields one tool_call and requests approval for it. */
-function approvalFakeSession(sessionId: string, toolName = "exec_command"): RuntimeSession {
+function approvalFakeSession(sessionId: string, toolName = "write_file"): RuntimeSession {
   return {
     sessionId,
     toolPermission: (name) => (name === "read_tool" ? "r" : "rw"),
@@ -147,6 +148,8 @@ describe("session-manager", () => {
     expect(first.payload.text).toBe("hello");
     const states = serverEvents(events).filter((e) => e.type === "task_state");
     expect(states.map((s) => s.state)).toEqual(["running", "idle"]);
+    // Driving a run flips the row's has_trace cache (listing then never walks for it).
+    expect(sessions.findById("session-1")!.hasTrace).toBe(true);
     // Outputs and events are forwarded one by one and handed to the recorder.
     expect(recordedCtx[0]).toEqual({
       projectId: "p1",
@@ -197,7 +200,7 @@ describe("session-manager", () => {
       skipReconnectWait: () => false,
       async *run(): AsyncGenerator<OmniMessage> {
         yield requestBegin();
-        yield toolCall({ name: "exec_command", arguments: "{}", toolCallId: "tc-1" });
+        yield toolCall({ name: "write_file", arguments: "{}", toolCallId: "tc-1" });
         yield toolCallOutput({
           output: "ls: /nope\n[tool error] exit code 2",
           toolCallId: "tc-1",
@@ -213,8 +216,8 @@ describe("session-manager", () => {
     await waitFor(() => manager.statusOf("session-1") === "idle" && captured.length >= 2);
 
     expect(captured.map((a) => [a.source, a.code, a.kind])).toEqual([
-      ["environment", "tool_failed:exec_command", "expected"], // error fed back to the model; the Agent adjusts on its own
-      ["llm", "llm_failed", "unexpected"], // not retryable, requires human intervention
+      ["environment", "tool_failed:write_file", "expected"], // error fed back to the model; the Agent adjusts on its own
+      ["llm", "llm_failed", "unexpected"], // the abort follows it: the retries did not recover it, so a human is needed
     ]);
     expect(captured[0]!.ctx).toEqual({ projectId: "p1", agentId: "a1", sessionId: "session-1" });
     expect(String(captured[0]!.err)).toContain("[tool error] exit code 2");
@@ -239,14 +242,14 @@ describe("session-manager", () => {
   it("steer: forwards to the running session; idle / lost race → 409 not_running", async () => {
     const steered: string[] = [];
     const fake = approvalFakeSession("session-1");
-    fake.steer = (text: string) => {
-      steered.push(text);
+    fake.steer = (input: OmniMessage[]) => {
+      steered.push((input[0]!.payload as TextPayload).text);
       return true;
     };
     const manager = makeManager(loaderOf(fake));
     const steerErr = (text: string): unknown => {
       try {
-        manager.steer("session-1", text);
+        manager.steer("session-1", [userText(text)], { text, images: 0, files: 0 });
         return null;
       } catch (e) {
         return e;
@@ -273,6 +276,61 @@ describe("session-manager", () => {
     await waitFor(() => manager.statusOf("session-1") === "idle");
     // Idle again after the run: 409.
     expect((steerErr("post") as HttpError).code).toBe("not_running");
+  });
+
+  it("pendingSteering mirror: broadcast with task_state on steer, shifted at delivery, dropped at run end", async () => {
+    // Two approval parks, with core's delivery shape — one `[user_steering]` user text —
+    // yielded between them, so the mid-run shift is observable while the run keeps going.
+    const fake: RuntimeSession = {
+      ...approvalFakeSession("session-1"),
+      steer: () => true,
+      async *run(_input: OmniMessage[], opts: { approve: ApproveFn; signal: AbortSignal }) {
+        const tc1 = toolCall({ name: "write_file", arguments: "{}", toolCallId: "tc-1" });
+        yield tc1;
+        yield approvalDecision(await opts.approve(tc1), "tc-1");
+        yield userText(userSteeringText("focus on tests"));
+        const tc2 = toolCall({ name: "write_file", arguments: "{}", toolCallId: "tc-2" });
+        yield tc2;
+        yield approvalDecision(await opts.approve(tc2), "tc-2");
+        yield assistantText("done");
+      },
+    };
+    const manager = makeManager(loaderOf(fake));
+    const events = capture("session-1");
+    await manager.startTask("session-1", [userText("go")]);
+    await waitFor(() => manager.pendingApprovalCount("session-1") === 1);
+
+    // Two queued steering messages: the mirror keeps both, in queue order.
+    manager.steer("session-1", [userText("a")], { text: "focus on tests", images: 0, files: 0 });
+    manager.steer("session-1", [userText("b")], { text: "later", images: 1, files: 2 });
+    expect(manager.pendingSteeringOf("session-1")).toEqual([
+      { text: "focus on tests", images: 0, files: 0 },
+      { text: "later", images: 1, files: 2 },
+    ]);
+
+    // First delivery observed on the stream: the mirror shifts while the run is still going.
+    manager.decideApproval("session-1", "tc-1", "allow");
+    await waitFor(() => manager.pendingSteeringOf("session-1").length === 1);
+    expect(manager.statusOf("session-1")).toBe("running");
+    expect(manager.pendingSteeringOf("session-1")).toEqual([
+      { text: "later", images: 1, files: 2 },
+    ]);
+
+    // Run end: core discards undelivered steering, and the mirror goes with it.
+    await waitFor(() => manager.pendingApprovalCount("session-1") === 1);
+    manager.decideApproval("session-1", "tc-2", "allow");
+    await waitFor(() => manager.statusOf("session-1") === "idle");
+    expect(manager.pendingSteeringOf("session-1")).toEqual([]);
+
+    // task_state broadcasts traced the whole lifecycle: grow to 1, 2, shift to 1, gone at idle.
+    const states = serverEvents(events).filter((e) => e.type === "task_state");
+    const mirrored = states
+      .filter((e) => e.pendingSteering !== undefined)
+      .map((e) => (e.pendingSteering as unknown[]).length);
+    expect(mirrored).toEqual([1, 2, 1]);
+    const last = states[states.length - 1]!;
+    expect(last.state).toBe("idle");
+    expect(last.pendingSteering).toBeUndefined();
   });
 
   it("queueIfBusy: enqueues while running, auto-starts in order after each finish; abort keeps the queue", async () => {

@@ -9,7 +9,7 @@ import { S } from "../../lib/strings";
 import { useLocale } from "../../state/locale";
 import { formatMessageTime } from "../../lib/format";
 import { STAT_ICONS } from "../../lib/stat-icons";
-import { splitImageAttachments } from "../../lib/attachments";
+import { splitAttachments } from "../../lib/attachments";
 import type { ChatItem, ReconnectItem } from "../../lib/omni/stream-model";
 import { Md } from "./md";
 import { GlyphIcon } from "../../components/ui/glyph-icon";
@@ -23,11 +23,12 @@ import { GoalRoundBanner } from "./goal-banner";
 import { HandoffBanner, ModelSwitchBanner } from "./handoff-banner";
 import { ScheduledBanner } from "./scheduled-banner";
 import { SkillsBanner } from "./skills-banner";
+import { AttachedFilesBanner } from "./attached-files-banner";
 import {
   parseHandoffMessage,
   parseModelSwitchMessage,
   parseScheduledMessage,
-} from "./agent-mentions";
+} from "./agent-handoff";
 import { parseGoalMessage } from "./goal-use";
 import { parseSkillsMessage } from "./skill-use";
 import { TaskStatsLine } from "./task-stats-line";
@@ -176,7 +177,7 @@ function ReconnectLine({ item, ctx }: { item: ReconnectItem; ctx: StreamRenderCo
 export function MessageItem({ item, ctx }: { item: ChatItem; ctx: StreamRenderContext }) {
   switch (item.kind) {
     case "user_text": {
-      // Source block for a chat created via @ handoff: collapsed into a single-line handoff notice (the raw text isn't shown), clickable to jump back to the original chat.
+      // Source block for a chat created via the /agent handoff: collapsed into a single-line handoff notice (the raw text isn't shown), clickable to jump back to the original chat.
       const handoff = parseHandoffMessage(item.text);
       if (handoff) return <HandoffBanner origin={handoff} />;
       // Source block for a chat opened by the /model switch: collapsed into a single-line switch notice, clickable to jump back to the source conversation.
@@ -194,18 +195,21 @@ export function MessageItem({ item, ctx }: { item: ChatItem; ctx: StreamRenderCo
       // "using skill" banner, with the body rendered as usual.
       const afterScheduled = scheduled ? scheduled.rest : afterGoal;
       const skills = parseSkillsMessage(afterScheduled);
-      // Attachment row restoration: for models that don't support images, input images are
-      // written to disk as a path row; this pulls that out at render time and shows the actual
-      // image. Mirrors the vision-model path (user_text + user_image as separate messages) in
-      // shape: one bubble for the text, one bubble per image, styled the same as user_image.
-      const { text, images } = splitImageAttachments(skills ? skills.rest : afterScheduled);
+      // Attachment row restoration (last in the chain — these lines trail the body rather than
+      // prefixing it): for models that don't support images, input images are written to disk
+      // as a path row; this pulls that out at render time and shows the actual image. Mirrors
+      // the vision-model path (user_text + user_image as separate messages) in shape: one
+      // bubble for the text, one bubble per image, styled the same as user_image. Uploaded
+      // files come out of the same pass and collapse into one banner naming them.
+      const { text, images, files } = splitAttachments(skills ? skills.rest : afterScheduled);
       // Every goal round reads like a normal user message: the body in a user bubble with
-      // the round notice beneath (the system IS re-sending the user's request each round).
+      // the round notice beneath (the system IS re-sending the user's request each round) —
+      // the objective's images included, since they ride it as path lines.
       if (goalRound) {
         return (
           <>
             {skills && <SkillsBanner names={skills.skills} />}
-            <GoalRoundBanner round={goalRound.round} objective={text} />
+            <GoalRoundBanner round={goalRound.round} objective={text} images={images} />
           </>
         );
       }
@@ -213,6 +217,10 @@ export function MessageItem({ item, ctx }: { item: ChatItem; ctx: StreamRenderCo
         <>
           {scheduled && <ScheduledBanner origin={scheduled.origin} />}
           {skills && <SkillsBanner names={skills.skills} />}
+          {/* Files uploaded with this message: named above the bubble, like the other
+              message-level notices — the bytes live in the session scratchpad, the model
+              opens them by path (goal mode never gets here: it takes text and images only). */}
+          {files.length > 0 && <AttachedFilesBanner files={files} />}
           {text && (
             <div className="anim-msg group my-4 flex flex-col items-end">
               <div className="max-w-[88%] rounded-lg bg-gray-100 px-4 py-2.5 md:max-w-[75%] dark:bg-gray-800">
@@ -246,32 +254,53 @@ export function MessageItem({ item, ctx }: { item: ChatItem; ctx: StreamRenderCo
         </>
       );
     }
-    case "user_steering":
+    case "user_steering": {
       // Mid-run steering ([user_steering]-wrapped user text delivered between turns): a
       // compact right-aligned user-styled chip inside the running Task's flow — visually
       // lighter than a full prompt bubble, since it doesn't start a new Task (the Trace page
       // still shows the raw marker text as-is).
+      // Images sent with the message live inside the same chip: `item.images` on a vision
+      // model (delivered as image messages right behind the text), or restored from the
+      // [attached image: …] path lines without one — the same two shapes a user_text bubble
+      // handles, so both render identically here.
+      const { text: steerText, images: steerImages } = splitAttachments(item.text);
+      const shown = [...steerImages, ...(item.images ?? [])];
       return (
         <div className="anim-msg group my-2 flex flex-col items-end">
-          <div className="flex max-w-[88%] items-start gap-1.5 rounded-md border border-gray-200 bg-gray-100 px-3 py-1.5 md:max-w-[75%] dark:border-gray-700 dark:bg-gray-800">
-            <GlyphIcon
-              d={USER_STEERING_ICON}
-              className="mt-1 shrink-0 text-gray-400 dark:text-gray-500"
-            />
-            <p className="wrap-anywhere whitespace-pre-wrap text-sm leading-relaxed text-gray-800 dark:text-gray-100">
-              <span className="mr-1.5 text-xs font-semibold text-gray-500 dark:text-gray-400">
-                {S.chat.userSteering}
-              </span>
-              {item.text}
-            </p>
+          <div className="flex max-w-[88%] flex-col gap-1.5 rounded-md border border-gray-200 bg-gray-100 px-3 py-1.5 md:max-w-[75%] dark:border-gray-700 dark:bg-gray-800">
+            <div className="flex items-start gap-1.5">
+              <GlyphIcon
+                d={USER_STEERING_ICON}
+                className="mt-1 shrink-0 text-gray-400 dark:text-gray-500"
+              />
+              <p className="wrap-anywhere whitespace-pre-wrap text-sm leading-relaxed text-gray-800 dark:text-gray-100">
+                <span className="mr-1.5 text-xs font-semibold text-gray-500 dark:text-gray-400">
+                  {S.chat.userSteering}
+                </span>
+                {steerText}
+              </p>
+            </div>
+            {shown.length > 0 && (
+              <div className="flex flex-wrap justify-end gap-1.5">
+                {shown.map((src, i) => (
+                  <ZoomableImage
+                    key={i}
+                    src={src}
+                    alt={S.chat.imageAlt}
+                    className="max-h-28 max-w-full rounded-md"
+                  />
+                ))}
+              </div>
+            )}
           </div>
           <MessageMeta
             {...(item.atMs !== undefined ? { atMs: item.atMs } : {})}
-            text={item.text}
+            text={steerText}
             align="right"
           />
         </div>
       );
+    }
     case "user_image":
       return (
         <div className="anim-msg group my-4 flex flex-col items-end">
@@ -299,8 +328,8 @@ export function MessageItem({ item, ctx }: { item: ChatItem; ctx: StreamRenderCo
           {item.stopReason && item.stopReason !== "completed" && (
             <span className="ml-1 font-mono text-xs text-gray-400">[{item.stopReason}]</span>
           )}
-          {/* File summary card (Codex-style): aggregates file references in the text once streaming ends (lists only ones confirmed to exist). */}
-          {!item.streaming && ctx.onOpenFile && ctx.statFiles && (
+          {/* Nested models don't produce task_stats, so preserve their existing message-level file summaries. The root conversation renders one aggregated card from task_stats instead. */}
+          {ctx.origin.length > 0 && !item.streaming && ctx.onOpenFile && ctx.statFiles && (
             <MessageFilesCard
               text={item.text}
               workspace={ctx.workspace ?? null}
@@ -334,12 +363,26 @@ export function MessageItem({ item, ctx }: { item: ChatItem; ctx: StreamRenderCo
       return <CompactionBanner item={item} />;
     case "task_stats":
       return (
-        <TaskStatsLine
-          stats={item.stats}
-          assistantText={item.assistantText}
-          cost={item.stats ? (ctx.taskCost?.(item.stats) ?? null) : null}
-          {...(item.atMs !== undefined ? { atMs: item.atMs } : {})}
-        />
+        <>
+          {/* Root-session file references are a Task-level summary: task_stats is emitted only after the Task closes, and assistantText aggregates every assistant segment in that Task. */}
+          {ctx.origin.length === 0 &&
+            ctx.onOpenFile &&
+            ctx.statFiles &&
+            item.assistantText.trim() !== "" && (
+              <MessageFilesCard
+                text={item.assistantText}
+                workspace={ctx.workspace ?? null}
+                statFiles={ctx.statFiles}
+                onOpenFile={ctx.onOpenFile}
+              />
+            )}
+          <TaskStatsLine
+            stats={item.stats}
+            assistantText={item.assistantText}
+            cost={item.stats ? (ctx.taskCost?.(item.stats) ?? null) : null}
+            {...(item.atMs !== undefined ? { atMs: item.atMs } : {})}
+          />
+        </>
       );
   }
 }

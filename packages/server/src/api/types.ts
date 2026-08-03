@@ -110,6 +110,12 @@ export interface UiPrefs {
   lastProjectId?: string;
   /** Whether the "no API key configured" guide has already been shown: once ever (on first visit to the chat page). */
   credentialGuideSeen?: boolean;
+  /**
+   * Also list CLI-created Sessions in the sidebar (`cli=1` on the sessions list). Default
+   * off: the list then serves web rows straight from the DB, with no Trace-directory
+   * scanning (#139).
+   */
+  showCliSessions?: boolean;
   [key: string]: unknown;
 }
 
@@ -149,6 +155,15 @@ export interface ProjectCreateRequest {
 }
 
 export interface ProjectCreateResponse {
+  project: ProjectSummary;
+}
+
+export interface ProjectUpdateRequest {
+  /** New display name. The projectId itself is immutable — only this label can change. */
+  name: string;
+}
+
+export interface ProjectUpdateResponse {
   project: ProjectSummary;
 }
 
@@ -604,11 +619,21 @@ export interface MessagesResponse {
 // ---------------------------------------------------------------------------
 
 /**
- * A single Prompt's input parts: text or image (data: / http(s) URL).
+ * A single Prompt's input parts: text, image (data: / http(s) URL), or an uploaded file.
  * Docs: /docs/server-api § "Session-Level Endpoints".
  */
 export type TaskInputPart =
-  { type: "text"; text: string } | { type: "image_url"; imageUrl: string };
+  | { type: "text"; text: string }
+  | { type: "image_url"; imageUrl: string }
+  /**
+   * File attachment (the composer's "+" menu): `dataUrl` is a base64 `data:` URL of the
+   * file's bytes, capped at 10MB each (413 `file_too_large` beyond that; the request as a
+   * whole still has to fit the global 20MB body limit). The server writes it into the
+   * Session scratchpad under a sanitized name and appends an `[attached file: <path>]` line
+   * to the message text — the bytes never enter the conversation, the model opens the file
+   * by path. `fileName` is the original name (no path separators, no `..`).
+   */
+  | { type: "file"; fileName: string; dataUrl: string };
 
 export interface TaskCreateRequest {
   input: TaskInputPart[];
@@ -664,8 +689,39 @@ export interface TaskCreateResponse {
  * task POST).
  */
 export interface SteerRequest {
-  /** Non-empty message text (trimmed server-side). */
+  /** Message text (trimmed server-side); may be empty when `images` or `files` carries the message. */
   text: string;
+  /**
+   * Images sent with the steering message (`data:` or http(s) URLs, same rule as
+   * `TaskInputPart.image_url`): delivered as user image messages right behind the
+   * `[user_steering]` text. A model without vision receives them as scratchpad path lines
+   * instead, exactly as it would a Prompt's images. At least one of `text` / `images` /
+   * `files` must be non-empty.
+   */
+  images?: string[];
+  /**
+   * File attachments riding the steering message — the same shape, caps and handling as a
+   * task input's `{type:"file"}` parts: written into the Session scratchpad and delivered
+   * as `[attached file: <path>]` lines on the `[user_steering]` text, so a file-only draft
+   * steers exactly like an image-only one instead of falling back to the follow-up queue.
+   */
+  files?: { fileName: string; dataUrl: string }[];
+}
+
+/**
+ * One steering message queued on the server but not yet delivered to the model (delivery
+ * happens at the next input assembly between turns). Carried on `task_state` events and the
+ * SSE subscribe snapshot so the composer's "steering queued" hint — including what was sent —
+ * survives reloads; entries leave the list as their `[user_steering]` message appears on the
+ * stream, and the whole list drops when the run exits (core discards undelivered steering).
+ */
+export interface PendingSteeringInfo {
+  /** The message text as accepted (trimmed); may be empty when images/files carry the message. */
+  text: string;
+  /** Number of images that rode along. */
+  images: number;
+  /** Number of file attachments that rode along. */
+  files: number;
 }
 
 export interface ApprovalDecisionRequest {
@@ -694,7 +750,13 @@ export type ServerEvent =
    */
   | { type: "approval_request"; toolCall: OmniMessage<ToolCallPayload>; origin?: string[] }
   /** Session run status flip (for toggling the input area and list); `queued` = queued follow-up count (see TaskCreateRequest.queueIfBusy). */
-  | { type: "task_state"; state: SessionStatus; queued?: number }
+  | {
+      type: "task_state";
+      state: SessionStatus;
+      queued?: number;
+      /** Steering messages queued but not yet delivered (absent = none): lets the composer's hint and its content survive reloads. */
+      pendingSteering?: PendingSteeringInfo[];
+    }
   /** The model-generated title after the first turn has been persisted (for in-place list updates). */
   | { type: "session_title"; sessionId: string; title: string }
   /** Last-Event-ID has been evicted from the buffer: the frontend should re-fetch the history endpoint before continuing to consume this connection. */
@@ -1085,8 +1147,20 @@ export interface UsageErrors {
   unexpected: number;
   /** The most frequent source · code (null when there are no errors). */
   topCode: UsageErrorCount | null;
-  /** Most recent N items (reverse chronological). */
+  /** Most recent N items (reverse chronological) — the first page; older ones come from `GET /usage/errors`. */
   recent: UsageErrorItem[];
+}
+
+/**
+ * GET /api/projects/:projectId/usage/errors — one page of the error detail table, newest
+ * first. The dashboard response above already carries the first page; this exists so
+ * "show me earlier ones" does not have to refetch the whole aggregate. It takes the same
+ * date/agent filter as the dashboard, so a page never widens what the summary counted.
+ */
+export interface UsageErrorsPage {
+  items: UsageErrorItem[];
+  /** Filtered row count, so the caller knows when it has reached the end. */
+  total: number;
 }
 
 export interface UsageResponse {
@@ -1192,22 +1266,23 @@ export interface AgentImportResponse {
 /** Raw result of a single run (a scoreboard per-case runs[] entry). */
 export interface BenchmarkRunScore {
   score: number;
-  cost?: number;
-  durationMs?: number;
+  /** Run cost, or null when unavailable. */
+  cost: number | null;
+  durationMs: number;
   /** Id of the Session under test in this run (links to Trace). */
-  sessionId?: string;
+  sessionId: string;
 }
 
 export interface BenchmarkCaseScore {
   case: string;
-  /** Per-case score = average of runs (equals that single run's score under the legacy single-run format). */
+  /** Model-written average of this Case's Run scores, on the fixed 0..100 scale. */
   score: number;
-  cost?: number;
-  durationMs?: number;
-  /** For legacy format compatibility: per-case single Session id (new format keeps it inside runs[]). */
-  sessionId?: string;
-  /** Raw results per run; unset under the legacy format (the server backfills one entry when parsing as a single run). */
-  runs?: BenchmarkRunScore[];
+  /** Model-written average of known Run costs; null when every Run cost is unknown. */
+  cost: number | null;
+  /** Model-written average of Run durations, rounded to an integer. */
+  durationMs: number;
+  /** Raw results per Run. */
+  runs: BenchmarkRunScore[];
 }
 
 export interface BenchmarkEvaluation {
@@ -1218,15 +1293,19 @@ export interface BenchmarkEvaluation {
   /** Evaluation summary body: how the score was derived, what optimizations were made to the Agent this round (required when generating, tolerated as unset when displaying). */
   summary?: string;
   /** Model actually used for this evaluation round (upstream id, paired with provider; the chart series is split by model). */
-  modelId?: string;
+  modelId: string;
   /** Provider group for `modelId`. */
-  provider?: string;
+  provider: string;
+  /** Thinking level read from the unchanged Target Agent configuration. */
+  thinkingLevel: string;
   /** Agent State version number under test. */
-  version?: number;
-  /** Total score (sum of per-case scores; max score defined by the scoring rubric). */
+  version: number;
+  /** Model-written average of Case scores, on the fixed 0..100 scale. */
   score: number;
-  cost?: number;
-  durationMs?: number;
+  /** Model-written average of known Case costs; null when every Case cost is unknown. */
+  cost: number | null;
+  /** Model-written average of Case durations, rounded to an integer. */
+  durationMs: number;
   cases: BenchmarkCaseScore[];
 }
 
@@ -1246,6 +1325,19 @@ export interface BenchmarkSummary {
 
 export interface BenchmarksResponse {
   benchmarks: BenchmarkSummary[];
+}
+
+export type CaseMaterial = "statement" | "rubric";
+
+/** Public Benchmark Case metadata. Rubric and Gold content are never included. */
+export interface BenchmarkCaseSummary {
+  id: string;
+  /** First Markdown heading with an optional leading "Case N:" removed; falls back to id. */
+  title: string;
+}
+
+export interface BenchmarkCasesResponse {
+  cases: BenchmarkCaseSummary[];
 }
 
 // ---------------------------------------------------------------------------
