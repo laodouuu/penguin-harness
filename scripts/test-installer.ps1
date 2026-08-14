@@ -72,11 +72,11 @@ function global:Invoke-WebRequest {
   $f.Requests.Add($Uri)
   if ($f.Mode -eq "404") { throw "fixture 404: $Uri" }
   if ($f.Mode -eq "network") { throw "fixture network failure: $Uri" }
-  if ($f.Mode -eq "primary-network" -and $Uri -like "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/*") {
+  if ($f.Mode -eq "primary-network" -and $Uri -like "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/*") {
     throw "fixture primary network failure"
   }
   if ($f.Mode -eq "forced-oss-payload" -and
-      $Uri -like "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/*/penguin-*") {
+      $Uri -like "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/*/penguin-*") {
     throw "fixture forced OSS payload failure"
   }
   if ($f.Mode -eq "forwarder-auto-github" -and $Uri -like "*/latest.json") {
@@ -94,7 +94,7 @@ function global:Invoke-WebRequest {
         @{
           schemaVersion = 1
           tag = "v0.0.0-test"
-          releaseBaseUrl = "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test"
+          releaseBaseUrl = "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test"
         } | ConvertTo-Json | Set-Content -LiteralPath $OutFile -Encoding ascii
       }
     }
@@ -289,13 +289,13 @@ try {
   Assert-True ($Version -eq "fixture-old") "canonical bundle was not installed"
 
   $stamped = Invoke-OnlineCase "stamped" "canonical" "" $true 2 $StampedInstaller
-  Assert-True ($stamped.Requests[0] -eq "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/penguin-win32-x64.zip") `
+  Assert-True ($stamped.Requests[0] -eq "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/penguin-win32-x64.zip") `
     "stamped installer did not select its own immutable OSS release"
   Assert-True (-not (($stamped.Requests | Out-String) -match 'latest\.json')) `
     "stamped installer unexpectedly resolved latest metadata"
 
   $stampedFallback = Invoke-OnlineCase "stamped-fallback" "primary-network" "" $true 3 $StampedInstaller
-  Assert-True ($stampedFallback.Requests[0] -like "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/*") `
+  Assert-True ($stampedFallback.Requests[0] -like "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/*") `
     "stamped installer did not try its own OSS release first"
   Assert-True ($stampedFallback.Requests[1] -like "https://github.com/*/releases/download/v0.0.0-test/penguin-win32-x64.zip") `
     "stamped installer did not fall back to the same GitHub version"
@@ -305,7 +305,7 @@ try {
     "benchmark did not request the release download manifest"
   Assert-True (($benchmarkSmall.Requests | Out-String) -match 'probe-64k\.bin') `
     "benchmark did not request the small probe"
-  Assert-True ($benchmarkSmall.Requests[-2] -like "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/*/penguin-win32-x64.zip") `
+  Assert-True ($benchmarkSmall.Requests[-2] -like "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/*/penguin-win32-x64.zip") `
     "small benchmark path did not keep the default OSS source"
 
   $benchmarkMissing = Invoke-OnlineCase "benchmark-missing-manifest" "benchmark-missing-manifest" "" $true 4 $StampedInstaller "1"
@@ -318,18 +318,18 @@ try {
     "stamped installer did not honor forced GitHub mode"
   Remove-Item Env:\PENGUIN_DOWNLOAD_SOURCE
 
-  $env:PENGUIN_DOWNLOAD_BASE_URL = "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test"
+  $env:PENGUIN_DOWNLOAD_BASE_URL = "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test"
   $override = Invoke-OnlineCase "download-base-override" "canonical" "" $true 2
-  Assert-True ($override.Requests[0] -eq "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/penguin-win32-x64.zip") `
+  Assert-True ($override.Requests[0] -eq "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/penguin-win32-x64.zip") `
     "download base override did not request the configured asset directory"
   Assert-True (($override.Output | Out-String) -match 'OSS mirror') `
     "download base override did not identify the OSS mirror"
   Assert-True (-not (($override.Output | Out-String) -match 'aliyuncs\.com')) `
     "download base override exposed the OSS URL in normal output"
 
-  $env:PENGUIN_DOWNLOAD_FALLBACK_BASE_URL = "https://github.com/Prism-Shadow/penguin-harness/releases/download/v0.0.0-test"
+  $env:PENGUIN_DOWNLOAD_FALLBACK_BASE_URL = "https://github.com/laodouuu/penguin-harness/releases/download/v0.0.0-test"
   $fallback = Invoke-OnlineCase "download-fallback" "primary-network" "" $true 3
-  Assert-True ($fallback.Requests[0] -like "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/*") `
+  Assert-True ($fallback.Requests[0] -like "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/*") `
     "download fallback did not try the primary source first"
   Assert-True ($fallback.Requests[1] -like "https://github.com/*/penguin-win32-x64.zip") `
     "download fallback did not use the same-version GitHub source"

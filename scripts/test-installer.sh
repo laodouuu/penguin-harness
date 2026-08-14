@@ -345,8 +345,8 @@ done
 printf '%s\n' "$url" >> "$REQUEST_LOG"
 base="${url##*/}"
 case "$MODE:$url" in
-  primary-network:https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/*) exit 7 ;;
-  forced-oss-payload:https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/*/penguin-*) exit 7 ;;
+  primary-network:https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/*) exit 7 ;;
+  forced-oss-payload:https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/*/penguin-*) exit 7 ;;
 esac
 case "$MODE:$base" in
   forwarder-auto-github:latest.json) exit 7 ;;
@@ -354,7 +354,7 @@ case "$MODE:$base" in
     printf '%s\n' '{"schemaVersion":1,"tag":"../invalid","releaseBaseUrl":"https://example.invalid"}' > "$output"
     ;;
   canonical:latest.json | outer-sha-mismatch:latest.json | inner-sha-mismatch:latest.json | forwarder-oss:latest.json | forced-oss-payload:latest.json)
-    printf '%s\n' '{"schemaVersion":1,"tag":"v0.0.0-test","releaseBaseUrl":"https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test"}' > "$output"
+    printf '%s\n' '{"schemaVersion":1,"tag":"v0.0.0-test","releaseBaseUrl":"https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test"}' > "$output"
     ;;
   benchmark-missing-manifest:release-download-manifest.tsv) exit 22 ;;
   benchmark-github-fast:release-download-manifest.tsv | benchmark-github-slightly-fast:release-download-manifest.tsv | benchmark-missing-manifest-github:release-download-manifest.tsv)
@@ -443,14 +443,14 @@ grep -q "/releases/v0.0.0-test/$HOST_ASSET\$" "$WORK_DIR/canonical.log" \
 
 run_online_case stamped canonical "" success 2 "" "" "$STAMPED_INSTALLER"
 [ "$(sed -n '1p' "$WORK_DIR/stamped.log")" = \
-  "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/$HOST_ASSET" ] \
+  "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/$HOST_ASSET" ] \
   || fail_test "stamped installer did not select its own immutable OSS release"
 ! grep -q "/latest.json\$" "$WORK_DIR/stamped.log" \
   || fail_test "stamped installer unexpectedly resolved latest metadata"
 
 run_online_case stamped-fallback primary-network "" success 3 "" "" "$STAMPED_INSTALLER"
 [ "$(sed -n '1p' "$WORK_DIR/stamped-fallback.log")" = \
-  "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/$HOST_ASSET" ] \
+  "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/$HOST_ASSET" ] \
   || fail_test "stamped installer did not try its own OSS release first"
 grep -q "github.com/.*/releases/download/v0.0.0-test/$HOST_ASSET\$" "$WORK_DIR/stamped-fallback.log" \
   || fail_test "stamped installer did not fall back to the same GitHub version"
@@ -472,16 +472,16 @@ run_online_case stamped-github canonical "" success 2 "" "" "$STAMPED_INSTALLER"
 grep -q "github.com/.*/releases/download/v0.0.0-test/$HOST_ASSET\$" "$WORK_DIR/stamped-github.log" \
   || fail_test "stamped installer did not honor forced GitHub mode"
 run_online_case download-base-override canonical "" success 2 \
-  "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test" ""
+  "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test" ""
 grep -q "OSS mirror" "$WORK_DIR/download-base-override.output" \
   || fail_test "download base override did not identify the OSS mirror"
 ! grep -q "aliyuncs.com" "$WORK_DIR/download-base-override.output" \
   || fail_test "download base override exposed the OSS URL in normal output"
 run_online_case download-fallback primary-network "" success 3 \
-  "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test" \
-  "https://github.com/Prism-Shadow/penguin-harness/releases/download/v0.0.0-test"
+  "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test" \
+  "https://github.com/laodouuu/penguin-harness/releases/download/v0.0.0-test"
 [ "$(sed -n '1p' "$WORK_DIR/download-fallback.log")" = \
-  "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/$HOST_ASSET" ] \
+  "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/$HOST_ASSET" ] \
   || fail_test "download fallback did not try the primary source first"
 grep -q "github.com/.*/releases/download/v0.0.0-test/$HOST_ASSET\$" "$WORK_DIR/download-fallback.log" \
   || fail_test "download fallback did not use the same-version GitHub source"
@@ -565,15 +565,15 @@ run_forwarder_case forwarder-forced-oss-no-fallback forced-oss-payload 2 oss v0.
 
 run_forwarder_case forwarder-pinned canonical 3 auto v0.0.0-test
 [ "$(sed -n '1p' "$WORK_DIR/forwarder-pinned.log")" = \
-  "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/install.sh" ] \
+  "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/install.sh" ] \
   || fail_test "pinned forwarder did not request the versioned installer"
 [ "$(sed -n '2p' "$WORK_DIR/forwarder-pinned.log")" = \
-  "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/$HOST_ASSET" ] \
+  "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/$HOST_ASSET" ] \
   || fail_test "pinned installer did not keep the selected release version"
 
 run_forwarder_case forwarder-benchmark-handoff benchmark-github-fast 8 auto v0.0.0-test success 1
 [ "$(sed -n '1p' "$WORK_DIR/forwarder-benchmark-handoff.log")" = \
-  "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/install.sh" ] \
+  "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.0.0-test/install.sh" ] \
   || fail_test "benchmark handoff forwarder did not fetch the versioned OSS installer"
 grep -q "github.com/.*/releases/download/v0.0.0-test/$HOST_ASSET\$" "$WORK_DIR/forwarder-benchmark-handoff.log" \
   || fail_test "forwarder locked the payload source instead of letting the installer benchmark"

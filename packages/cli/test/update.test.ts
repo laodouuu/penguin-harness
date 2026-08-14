@@ -172,20 +172,20 @@ describe("normalizeVersion / compareVersions", () => {
 describe("installerUrl", () => {
   it("resolves the latest release when no version is pinned", () => {
     expect(installerUrl()).toBe(
-      "https://github.com/Prism-Shadow/penguin-harness/releases/latest/download/install.sh",
+      "https://github.com/laodouuu/penguin-harness/releases/latest/download/install.sh",
     );
   });
   it("pins a tag, normalising the v prefix", () => {
     const expected =
-      "https://github.com/Prism-Shadow/penguin-harness/releases/download/v0.1.2/install.sh";
+      "https://github.com/laodouuu/penguin-harness/releases/download/v0.1.2/install.sh";
     expect(installerUrl("0.1.2")).toBe(expected);
     expect(installerUrl("v0.1.2")).toBe(expected);
   });
 });
 
 describe("release source selection", () => {
-  const ossOrigin = "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com";
-  const githubApi = "https://api.github.com/repos/Prism-Shadow/penguin-harness/releases/latest";
+  const ossOrigin = "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com";
+  const githubApi = "https://api.github.com/repos/laodouuu/penguin-harness/releases/latest";
   const manifest = {
     schemaVersion: 1,
     tag: "v0.2.1",
@@ -306,8 +306,8 @@ describe("release source selection", () => {
       },
       {
         source: "github",
-        baseUrl: "https://github.com/Prism-Shadow/penguin-harness/releases/download/v0.2.0",
-        url: "https://github.com/Prism-Shadow/penguin-harness/releases/download/v0.2.0/install.sh",
+        baseUrl: "https://github.com/laodouuu/penguin-harness/releases/download/v0.2.0",
+        url: "https://github.com/laodouuu/penguin-harness/releases/download/v0.2.0/install.sh",
       },
     ]);
   });
@@ -427,16 +427,16 @@ describe("buildInstallerInvocation (preserves the shape of the install being upg
         hasBundledNode: true,
         version: "0.2.0",
         downloadBaseUrl:
-          "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0",
+          "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0",
         downloadFallbackBaseUrl:
-          "https://github.com/Prism-Shadow/penguin-harness/releases/download/v0.2.0",
+          "https://github.com/laodouuu/penguin-harness/releases/download/v0.2.0",
       }).env,
     ).toEqual({
       PENGUIN_VERSION: "v0.2.0",
       PENGUIN_DOWNLOAD_BASE_URL:
-        "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0",
+        "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0",
       PENGUIN_DOWNLOAD_FALLBACK_BASE_URL:
-        "https://github.com/Prism-Shadow/penguin-harness/releases/download/v0.2.0",
+        "https://github.com/laodouuu/penguin-harness/releases/download/v0.2.0",
     });
   });
 
@@ -460,15 +460,15 @@ describe("buildInstallerInvocation (preserves the shape of the install being upg
   it("keeps explicit mirrors strict but delegates non-explicit payload source selection", () => {
     const candidate = {
       source: "oss" as const,
-      baseUrl: "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0",
-      url: "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0/install.sh",
-      fallbackBaseUrl: "https://github.com/Prism-Shadow/penguin-harness/releases/download/v0.2.0",
+      baseUrl: "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0",
+      url: "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0/install.sh",
+      fallbackBaseUrl: "https://github.com/laodouuu/penguin-harness/releases/download/v0.2.0",
     };
     expect(payloadSourceEnv(candidate, true)).toEqual({
       downloadBaseUrl:
-        "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0",
+        "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com/releases/v0.2.0",
       downloadFallbackBaseUrl:
-        "https://github.com/Prism-Shadow/penguin-harness/releases/download/v0.2.0",
+        "https://github.com/laodouuu/penguin-harness/releases/download/v0.2.0",
     });
     expect(payloadSourceEnv(candidate, false)).toEqual({
       downloadBaseUrl: "",
