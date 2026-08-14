@@ -100,7 +100,9 @@ jobs:
     with:
       ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-      require_macos_signing: ${{ github.event_name != 'workflow_dispatch' || inputs.require_macos_signing }}
+      require_macos_signing: >-
+        ${{ github.repository == 'Prism-Shadow/penguin-harness' &&
+            (github.event_name != 'workflow_dispatch' || inputs.require_macos_signing) }}
     # The signing secrets themselves live in the `apple-signing` environment and resolve
     # inside the called job; `inherit` additionally forwards repo-level secrets so the
     # called workflow never sees a name shadowed to empty (the v0.2.2 failure mode).
