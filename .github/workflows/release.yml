@@ -48,6 +48,16 @@ on:
       tag:
         description: "Release tag (e.g. v0.1.0)"
         required: true
+      require_macos_signing:
+        description: "Sign and notarize macOS desktop artifacts"
+        required: false
+        type: boolean
+        default: true
+      publish_npm:
+        description: "Publish npm packages when running in the upstream repository"
+        required: false
+        type: boolean
+        default: true
 
 env:
   # Bundled Node runtime version (official nodejs.org dist, aligned with engines >=24).
@@ -90,7 +100,7 @@ jobs:
     with:
       ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-      require_macos_signing: true
+      require_macos_signing: ${{ github.event_name != 'workflow_dispatch' || inputs.require_macos_signing }}
     # The signing secrets themselves live in the `apple-signing` environment and resolve
     # inside the called job; `inherit` additionally forwards repo-level secrets so the
     # called workflow never sees a name shadowed to empty (the v0.2.2 failure mode).
@@ -526,6 +536,9 @@ jobs:
   publish-npm:
     name: Publish npm packages
     runs-on: ubuntu-latest
+    if: >-
+      ${{ github.repository == 'Prism-Shadow/penguin-harness' &&
+          (github.event_name != 'workflow_dispatch' || inputs.publish_npm) }}
     # OIDC trusted publishing (same as AgentHub's publish.yml): no token; npmjs establishes trust via
     # environment `npm` + this workflow. A publish failure doesn't affect the release job (independent, parallel).
     permissions:
