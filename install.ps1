@@ -36,8 +36,8 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue" # Invoke-WebRequest progress rendering slows downloads massively on PS 5.1
 
-$Repo = "https://github.com/Prism-Shadow/penguin-harness"
-$OssOrigin = "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com"
+$Repo = "https://github.com/laodouuu/penguin-harness"
+$OssOrigin = "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com"
 $OssReleaseRoot = "$OssOrigin/releases"
 $GitHubReleaseRoot = "$Repo/releases/download"
 $GitHubLatestBase = "$Repo/releases/latest/download"

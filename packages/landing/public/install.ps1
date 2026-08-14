@@ -12,10 +12,10 @@
   $ForwardedArgs = @($args)
   $ErrorActionPreference = "Stop"
   $ProgressPreference = "SilentlyContinue"
-  $OssOrigin = "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com"
+  $OssOrigin = "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com"
   $OssReleaseRoot = "$OssOrigin/releases"
-  $GitHubReleaseRoot = "https://github.com/Prism-Shadow/penguin-harness/releases/download"
-  $GitHubLatestBase = "https://github.com/Prism-Shadow/penguin-harness/releases/latest/download"
+  $GitHubReleaseRoot = "https://github.com/laodouuu/penguin-harness/releases/download"
+  $GitHubLatestBase = "https://github.com/laodouuu/penguin-harness/releases/latest/download"
 
   function Fail([string]$Message) {
     throw "error: $Message"

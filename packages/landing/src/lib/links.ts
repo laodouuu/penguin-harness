@@ -1,6 +1,6 @@
 /** External links and language-independent constants used across the landing page. */
 
-export const REPO_URL = "https://github.com/Prism-Shadow/penguin-harness";
+export const REPO_URL = "https://github.com/laodouuu/penguin-harness";
 export const RELEASES_URL = `${REPO_URL}/releases`;
 export const LICENSE_URL = `${REPO_URL}/blob/main/LICENSE`;
 
@@ -91,7 +91,7 @@ export const OPENROUTER_KEYS_URL = "https://openrouter.ai/workspaces/default/key
  * falls back to the GitHub links when that fetch fails (e.g. CORS not configured, or the
  * mirror unreachable).
  */
-export const OSS_ORIGIN = "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com";
+export const OSS_ORIGIN = "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com";
 export const OSS_LATEST_JSON_URL = `${OSS_ORIGIN}/latest.json`;
 export const GITHUB_LATEST_DOWNLOAD = `${REPO_URL}/releases/latest/download`;
 

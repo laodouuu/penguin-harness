@@ -10,9 +10,9 @@
 #   curl -fsSL https://penguin.ooo/install.sh | sh -s -- --universal
 #
 set -eu
-OSS_ORIGIN="https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com"
+OSS_ORIGIN="https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com"
 OSS_RELEASE_ROOT="$OSS_ORIGIN/releases"
-GITHUB_RELEASE_ROOT="https://github.com/Prism-Shadow/penguin-harness/releases/download"
+GITHUB_RELEASE_ROOT="https://github.com/laodouuu/penguin-harness/releases/download"
 SOURCE_MODE="${PENGUIN_DOWNLOAD_SOURCE:-auto}"
 
 fail() {
@@ -81,7 +81,7 @@ use_github() {
   if [ -n "$1" ]; then
     SELECTED_BASE="$GITHUB_RELEASE_ROOT/$1"
   else
-    SELECTED_BASE="https://github.com/Prism-Shadow/penguin-harness/releases/latest/download"
+    SELECTED_BASE="https://github.com/laodouuu/penguin-harness/releases/latest/download"
   fi
   FALLBACK_BASE=""
   download_installer "$SELECTED_BASE" \

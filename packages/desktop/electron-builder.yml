@@ -19,7 +19,7 @@ productName: PenguinHarness
 # it collected. electron-updater reads the same metadata from the Release.
 publish:
   provider: github
-  owner: Prism-Shadow
+  owner: laodouuu
   repo: penguin-harness
 directories:
   app: stage/app

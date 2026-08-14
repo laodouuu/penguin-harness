@@ -1,7 +1,7 @@
 #!/bin/sh
 # PenguinHarness one-line installer.
 #
-#   curl -fsSL https://github.com/Prism-Shadow/penguin-harness/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/laodouuu/penguin-harness/releases/latest/download/install.sh | sh
 #
 # Options:
 #   PENGUIN_VERSION=vX.Y.Z    choose a version (same as --version vX.Y.Z); a published Release
@@ -27,8 +27,8 @@
 # Docs: https://penguin.ooo/docs/installation
 set -eu
 
-REPO="https://github.com/Prism-Shadow/penguin-harness"
-OSS_ORIGIN="https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com"
+REPO="https://github.com/laodouuu/penguin-harness"
+OSS_ORIGIN="https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com"
 OSS_RELEASE_ROOT="$OSS_ORIGIN/releases"
 GITHUB_RELEASE_ROOT="$REPO/releases/download"
 GITHUB_LATEST_BASE="$REPO/releases/latest/download"

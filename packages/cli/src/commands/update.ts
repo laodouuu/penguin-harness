@@ -70,11 +70,11 @@ import type { InstallerSource, Messages } from "../i18n.js";
 export { compareVersions, normalizeVersion };
 
 /** Repository the released artifacts come from — the same repo install.sh downloads from. */
-export const REPO_SLUG = "Prism-Shadow/penguin-harness";
+export const REPO_SLUG = "laodouuu/penguin-harness";
 /** Releases API endpoint for the newest published release. */
 export const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO_SLUG}/releases/latest`;
 /** Public roots shared with the stable installer entry point. */
-export const OSS_ORIGIN = "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com";
+export const OSS_ORIGIN = "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com";
 export const OSS_RELEASE_ROOT = `${OSS_ORIGIN}/releases`;
 export const GITHUB_RELEASE_ROOT = `https://github.com/${REPO_SLUG}/releases/download`;
 
