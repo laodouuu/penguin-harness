@@ -43,7 +43,8 @@ $OssReleaseRoot = "$OssOrigin/releases"
 $GitHubReleaseRoot = "$Repo/releases/download"
 $GitHubLatestBase = "$Repo/releases/latest/download"
 $Asset = "penguin-win32-x64.zip"
-$BenchmarkTotalTimeoutSeconds = 5
+$BenchmarkTotalTimeoutSeconds = 8
+$BenchmarkGitHubMinBytesPerSecond = 262144
 $PayloadName = "payload.zip"
 # The release workflow replaces this token with the immutable tag before publishing both the
 # standalone installer and the copy sealed inside the Windows bundle.
@@ -210,11 +211,12 @@ function Invoke-ProbeDownload(
   [object]$Probe,
   [string]$Tmp,
   [string]$Label,
-  [DateTime]$Deadline
+  [DateTime]$Deadline,
+  [int]$MaxTimeoutSec = 2
 ) {
   $ProbePath = Join-Path $Tmp "probe-$Label-$($Probe.Name)"
   Remove-Item -LiteralPath $ProbePath -Force -ErrorAction SilentlyContinue
-  $TimeoutSec = Get-BenchmarkTimeoutSec $Deadline 2
+  $TimeoutSec = Get-BenchmarkTimeoutSec $Deadline $MaxTimeoutSec
   if ($TimeoutSec -le 0) {
     return [PSCustomObject]@{ Ok = $false; Seconds = 0.0 }
   }
@@ -241,20 +243,13 @@ function Invoke-ProbeDownload(
   [PSCustomObject]@{ Ok = $true; Seconds = $Seconds }
 }
 
-function Select-FastBenchmarkSource(
-  [object]$OssProbe,
+function Select-BenchmarkSource(
   [object]$GitHubProbe,
-  [Int64]$ProbeSize,
-  [Int64]$AssetSize
+  [Int64]$ProbeSize
 ) {
-  if ($GitHubProbe.Ok -and -not $OssProbe.Ok) { return "github" }
-  if ($OssProbe.Ok -and -not $GitHubProbe.Ok) { return "oss" }
-  if (-not $OssProbe.Ok -and -not $GitHubProbe.Ok) { return "" }
-
-  $OssEstimate = [double]$AssetSize / ([double]$ProbeSize / [Math]::Max([double]$OssProbe.Seconds, 0.001))
-  $GitHubEstimate = [double]$AssetSize / ([double]$ProbeSize / [Math]::Max([double]$GitHubProbe.Seconds, 0.001))
-  if ($GitHubEstimate -lt $OssEstimate) {
-    return "github"
+  if ($GitHubProbe.Ok) {
+    $GitHubBytesPerSecond = [double]$ProbeSize / [Math]::Max([double]$GitHubProbe.Seconds, 0.001)
+    if ($GitHubBytesPerSecond -ge $BenchmarkGitHubMinBytesPerSecond) { return "github" }
   }
   return "oss"
 }
@@ -285,15 +280,14 @@ function Select-BenchmarkDownloadSources([string]$Tag, [string]$Tmp) {
     return [PSCustomObject]@{ BaseUrl = $OssBase; FallbackBaseUrl = $GitHubBase }
   }
 
-  $OssLarge = Invoke-ProbeDownload $OssBase $Manifest.LargeProbe $Tmp "oss-large" $Deadline
-  $GitHubLarge = Invoke-ProbeDownload $GitHubBase $Manifest.LargeProbe $Tmp "github-large" $Deadline
-  $Choice = Select-FastBenchmarkSource $OssLarge $GitHubLarge $Manifest.LargeProbe.Size $Manifest.AssetSize
+  $GitHubLarge = Invoke-ProbeDownload $GitHubBase $Manifest.LargeProbe $Tmp "github-large" $Deadline 5
+  $Choice = Select-BenchmarkSource $GitHubLarge $Manifest.LargeProbe.Size
   if ($Choice -eq "github") {
-    Write-Host "Selected GitHub (shorter estimated download time)."
+    Write-Host "Selected GitHub (meets minimum download speed)."
     return [PSCustomObject]@{ BaseUrl = $GitHubBase; FallbackBaseUrl = $OssBase }
   }
   if ($Choice -eq "oss") {
-    Write-Host "Selected OSS mirror (shorter or equal estimated download time)."
+    Write-Host "Selected OSS mirror (GitHub did not meet minimum download speed)."
     return [PSCustomObject]@{ BaseUrl = $OssBase; FallbackBaseUrl = $GitHubBase }
   }
   return $null

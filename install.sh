@@ -42,7 +42,8 @@ SOURCE_MODE="${PENGUIN_DOWNLOAD_SOURCE:-auto}"
 DOWNLOAD_BASE_URL="${PENGUIN_DOWNLOAD_BASE_URL:-}"
 DOWNLOAD_FALLBACK_BASE_URL="${PENGUIN_DOWNLOAD_FALLBACK_BASE_URL:-}"
 DOWNLOAD_BENCHMARK="${PENGUIN_DOWNLOAD_BENCHMARK:-0}"
-BENCHMARK_TOTAL_TIMEOUT_SECONDS=5
+BENCHMARK_TOTAL_TIMEOUT_SECONDS=8
+BENCHMARK_GITHUB_MIN_BYTES_PER_SECOND=262144
 BENCHMARK_STARTED_AT=0
 PAYLOAD_NAME="payload.tar.gz"
 # The release workflow replaces this token with the immutable tag before publishing both the
@@ -352,10 +353,11 @@ probe_download_source() {
   pds_size="$4"
   pds_hash="$5"
   pds_metrics="$6"
+  pds_timeout_cap="${7:-2}"
   pds_body="$TMP/probe-$pds_label-$pds_file"
   pds_write="$pds_metrics.tmp"
   rm -f "$pds_body" "$pds_metrics" "$pds_write"
-  pds_timeout="$(benchmark_curl_timeout 2)" || {
+  pds_timeout="$(benchmark_curl_timeout "$pds_timeout_cap")" || {
     printf '%s\n' "fail" > "$pds_metrics"
     return 0
   }
@@ -401,12 +403,9 @@ probe_status() {
   fi
 }
 
-select_fast_source_from_metrics() {
-  sfm_oss_metrics="$1"
-  sfm_github_metrics="$2"
-  sfm_probe_size="$3"
-  sfm_asset_size="$4"
-  awk -v probe="$sfm_probe_size" -v asset="$sfm_asset_size" '
+select_benchmark_source_from_metrics() {
+  sfm_github_metrics="$1"
+  awk -v github_min="$BENCHMARK_GITHUB_MIN_BYTES_PER_SECOND" '
     function read_metrics(path, out, line, fields) {
       if ((getline line < path) <= 0) return 0
       close(path)
@@ -414,25 +413,16 @@ select_fast_source_from_metrics() {
       if (fields[1] != "ok") return 0
       out["start"] = fields[2] + 0
       out["total"] = fields[3] + 0
+      out["speed"] = fields[4] + 0
       return 1
     }
     BEGIN {
-      oss_ok = read_metrics(ARGV[1], oss)
-      github_ok = read_metrics(ARGV[2], github)
-      ARGV[1] = ""; ARGV[2] = ""
-      if (github_ok && !oss_ok) { print "github"; exit }
-      if (oss_ok && !github_ok) { print "oss"; exit }
-      if (!oss_ok && !github_ok) { print "oss"; exit }
-      oss_body = oss["total"] - oss["start"]
-      github_body = github["total"] - github["start"]
-      if (oss_body < 0.001) oss_body = 0.001
-      if (github_body < 0.001) github_body = 0.001
-      oss_est = oss["start"] + asset / (probe / oss_body)
-      github_est = github["start"] + asset / (probe / github_body)
-      if (github_est < oss_est) print "github"
-      else print "oss"
+      github_ok = read_metrics(ARGV[1], github)
+      ARGV[1] = ""
+      if (github_ok && github["speed"] >= github_min) { print "github"; exit }
+      print "oss"
     }
-  ' "$sfm_oss_metrics" "$sfm_github_metrics"
+  ' "$sfm_github_metrics"
 }
 
 benchmark_release_sources() {
@@ -473,16 +463,19 @@ benchmark_release_sources() {
     return 0
   fi
 
-  run_probe_pair "$BENCHMARK_LARGE_PROBE" "$BENCHMARK_LARGE_SIZE" "$BENCHMARK_LARGE_HASH"
-  brs_choice="$(select_fast_source_from_metrics "$OSS_PROBE_METRICS" "$GITHUB_PROBE_METRICS" "$BENCHMARK_LARGE_SIZE" "$BENCHMARK_ASSET_SIZE")"
+  GITHUB_PROBE_METRICS="$TMP/probe-github-$BENCHMARK_LARGE_PROBE.metrics"
+  probe_download_source github "$GITHUB_BENCHMARK_BASE_URL" "$BENCHMARK_LARGE_PROBE" "$BENCHMARK_LARGE_SIZE" "$BENCHMARK_LARGE_HASH" "$GITHUB_PROBE_METRICS" 5
+  brs_choice="$(select_benchmark_source_from_metrics "$GITHUB_PROBE_METRICS")"
   if [ "$brs_choice" = "github" ]; then
     BENCHMARK_BASE_URL="$GITHUB_BENCHMARK_BASE_URL"
     BENCHMARK_FALLBACK_BASE_URL="$OSS_BENCHMARK_BASE_URL"
-    echo "Selected GitHub (shorter estimated download time)."
-  else
+    echo "Selected GitHub (meets minimum download speed)."
+  elif [ "$brs_choice" = "oss" ]; then
     BENCHMARK_BASE_URL="$OSS_BENCHMARK_BASE_URL"
     BENCHMARK_FALLBACK_BASE_URL="$GITHUB_BENCHMARK_BASE_URL"
-    echo "Selected OSS mirror (shorter or equal estimated download time)."
+    echo "Selected OSS mirror (GitHub did not meet minimum download speed)."
+  else
+    return 1
   fi
   return 0
 }
