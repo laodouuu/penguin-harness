@@ -465,6 +465,11 @@ describe("selectAutoUpdateFeed", () => {
       primaryUrl: githubFeedUrl(TAG),
       fallbackUrl: ossFeedUrl(TAG),
     });
+    expect(logs).toContain(
+      `Resolved update release ${TAG}; testing OSS mirror and GitHub download sources ...`,
+    );
+    expect(logs).toContain("Small probe: OSS mirror=ok, GitHub=ok.");
+    expect(logs.some((line) => line.startsWith("GitHub large probe:"))).toBe(true);
     expect(logs).toContain("Selected GitHub (meets minimum download speed).");
   });
 
@@ -477,6 +482,7 @@ describe("selectAutoUpdateFeed", () => {
       primaryUrl: ossFeedUrl(TAG),
       fallbackUrl: githubFeedUrl(TAG),
     });
+    expect(logs.some((line) => line.startsWith("OSS mirror large probe:"))).toBe(true);
     expect(logs).toContain("Selected OSS mirror (clearly faster than GitHub here).");
   });
 

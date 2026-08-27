@@ -48,6 +48,21 @@ on:
       tag:
         description: "Release tag (e.g. v0.1.0)"
         required: true
+      require_macos_signing:
+        description: "Sign and notarize macOS desktop artifacts"
+        required: false
+        type: boolean
+        default: true
+      require_windows_signing:
+        description: "Sign Windows desktop artifacts with EVSign"
+        required: false
+        type: boolean
+        default: true
+      publish_npm:
+        description: "Publish npm packages when running in the upstream repository"
+        required: false
+        type: boolean
+        default: true
 
 env:
   # Bundled Node runtime version (official nodejs.org dist, aligned with engines >=24).
@@ -90,8 +105,12 @@ jobs:
     with:
       ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
       tag: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-      require_macos_signing: true
-      require_windows_signing: true
+      require_macos_signing: >-
+        ${{ github.repository == 'Prism-Shadow/penguin-harness' &&
+            (github.event_name != 'workflow_dispatch' || inputs.require_macos_signing) }}
+      require_windows_signing: >-
+        ${{ github.repository == 'Prism-Shadow/penguin-harness' &&
+            (github.event_name != 'workflow_dispatch' || inputs.require_windows_signing) }}
     # The signing secrets themselves live in the called workflow's matrix environments
     # (`apple-signing` for macOS, `desktop-build` for Windows) and resolve inside those
     # jobs; `inherit` additionally forwards repo-level secrets so the called workflow
@@ -145,7 +164,7 @@ jobs:
             PKG_V="$(node -p 'require("./package.json").version')"
             if [ "$PKG_V" != "$V" ]; then
               MSG="tag $TAG does not match the repo version $PKG_V; bump root + packages/*/package.json and core VERSION during release prep, then re-tag (see CONTRIBUTING.md)."
-              if [ "${EVENT_NAME:-}" = "push" ]; then
+              if [ "${EVENT_NAME:-}" = "push" ] && [ "${GITHUB_REPOSITORY:-}" = "Prism-Shadow/penguin-harness" ]; then
                 echo "error: $MSG" >&2
                 exit 1
               fi
@@ -541,6 +560,9 @@ jobs:
   publish-npm:
     name: Publish npm packages
     runs-on: ubuntu-latest
+    if: >-
+      ${{ github.repository == 'Prism-Shadow/penguin-harness' &&
+          (github.event_name != 'workflow_dispatch' || inputs.publish_npm) }}
     # OIDC trusted publishing (same as AgentHub's publish.yml): no token; npmjs establishes trust via
     # environment `npm` + this workflow. A publish failure doesn't affect the release job (independent, parallel).
     permissions:
@@ -594,7 +616,7 @@ jobs:
             PKG_V="$(node -p 'require("./package.json").version')"
             if [ "$PKG_V" != "$V" ]; then
               MSG="tag $TAG does not match the repo version $PKG_V; bump root + packages/*/package.json and core VERSION during release prep, then re-tag (see CONTRIBUTING.md)."
-              if [ "${EVENT_NAME:-}" = "push" ]; then
+              if [ "${EVENT_NAME:-}" = "push" ] && [ "${GITHUB_REPOSITORY:-}" = "Prism-Shadow/penguin-harness" ]; then
                 echo "error: $MSG" >&2
                 exit 1
               fi

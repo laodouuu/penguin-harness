@@ -19,6 +19,8 @@
  * gates only apply to signed release builds. Linux AppImage continues without
  * code-signing for now.
  */
+import fs from "node:fs";
+import path from "node:path";
 import { app, dialog, net, shell } from "electron";
 import type { BrowserWindow } from "electron";
 import electronUpdater from "electron-updater";
@@ -41,10 +43,20 @@ const FIRST_CHECK_DELAY_MS = 20_000;
 /** Subsequent automatic checks. */
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
-const RELEASES_URL = "https://github.com/Prism-Shadow/penguin-harness/releases";
+const RELEASES_URL = "https://github.com/laodouuu/penguin-harness/releases";
+
+let updaterLogPath: string | null = null;
 
 function log(line: string): void {
-  process.stdout.write(`[updater] ${line}\n`);
+  const formatted = `[updater] ${line}\n`;
+  process.stdout.write(formatted);
+  try {
+    updaterLogPath ??= path.join(app.getPath("userData"), "updater.log");
+    fs.mkdirSync(path.dirname(updaterLogPath), { recursive: true });
+    fs.appendFileSync(updaterLogPath, formatted, "utf8");
+  } catch {
+    // Update logging must never interfere with startup or installation.
+  }
 }
 
 let manualCheckInFlight = false;

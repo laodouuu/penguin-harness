@@ -13,10 +13,9 @@
  */
 import { createHash } from "node:crypto";
 
-export const OSS_ORIGIN = "https://penguin-harness-releases.oss-cn-beijing.aliyuncs.com";
+export const OSS_ORIGIN = "https://penguin-harness-fork-releases.oss-cn-beijing.aliyuncs.com";
 export const OSS_RELEASE_ROOT = `${OSS_ORIGIN}/releases`;
-export const GITHUB_RELEASE_ROOT =
-  "https://github.com/Prism-Shadow/penguin-harness/releases/download";
+export const GITHUB_RELEASE_ROOT = "https://github.com/laodouuu/penguin-harness/releases/download";
 export const OSS_LATEST_JSON_URL = `${OSS_ORIGIN}/latest.json`;
 
 /** Same contract as the release installers (install.sh / install.ps1). */
@@ -212,6 +211,19 @@ function probeSpeed(result: ProbeResult): number {
   return result.ok && result.speedBps !== undefined ? result.speedBps : 0;
 }
 
+function formatBytesPerSecond(bytesPerSecond: number): string {
+  if (bytesPerSecond <= 0) return "unavailable";
+  const kib = bytesPerSecond / 1024;
+  if (kib < 1024) return `${Math.round(kib)} KiB/s`;
+  return `${(kib / 1024).toFixed(2)} MiB/s`;
+}
+
+function formatProbeResult(result: ProbeResult): string {
+  if (!result.ok) return "failed";
+  if (result.speedBps === undefined) return "ok";
+  return formatBytesPerSecond(result.speedBps);
+}
+
 export function selectMeasuredSource(githubBps: number, ossBps: number): "github" | "oss" {
   if (githubBps >= SPEED_PROBE_GITHUB_MIN_BYTES_PER_SECOND) return "github";
   return ossBps > githubBps * SPEED_PROBE_OSS_SWITCH_RATIO ? "oss" : "github";
@@ -299,7 +311,7 @@ export async function selectAutoUpdateFeed(
   const manifest = await loadReleaseDownloadManifest({ fetchFn, tag, assetName, deadlineMs });
   if (manifest === null) return inconclusive();
 
-  log("Testing OSS mirror and GitHub download sources ...");
+  log(`Resolved update release ${tag}; testing OSS mirror and GitHub download sources ...`);
   const ossBase = `${OSS_RELEASE_ROOT}/${tag}`;
   const githubBase = `${GITHUB_RELEASE_ROOT}/${tag}`;
 
@@ -321,6 +333,11 @@ export async function selectAutoUpdateFeed(
       wantSpeed: false,
     }),
   ]);
+  log(
+    `Small probe: OSS mirror=${formatProbeResult(ossSmall)}, GitHub=${formatProbeResult(
+      githubSmall,
+    )}.`,
+  );
 
   if (!ossSmall.ok && githubSmall.ok) {
     log("Selected GitHub (OSS mirror probe unavailable).");
@@ -341,6 +358,11 @@ export async function selectAutoUpdateFeed(
     wantSpeed: true,
   });
   const githubSpeed = probeSpeed(githubLarge);
+  log(
+    `GitHub large probe: ${formatProbeResult(githubLarge)} (minimum ${formatBytesPerSecond(
+      SPEED_PROBE_GITHUB_MIN_BYTES_PER_SECOND,
+    )}).`,
+  );
   if (githubSpeed >= SPEED_PROBE_GITHUB_MIN_BYTES_PER_SECOND) {
     log("Selected GitHub (meets minimum download speed).");
     return { kind: "pinned", primaryUrl: githubFeedUrl(tag), fallbackUrl: ossFeedUrl(tag) };
@@ -355,6 +377,11 @@ export async function selectAutoUpdateFeed(
     wantSpeed: true,
   });
   const ossSpeed = probeSpeed(ossLarge);
+  log(
+    `OSS mirror large probe: ${formatProbeResult(ossLarge)} (switch threshold ${formatBytesPerSecond(
+      Math.floor(githubSpeed * SPEED_PROBE_OSS_SWITCH_RATIO),
+    )}).`,
+  );
   if (selectMeasuredSource(githubSpeed, ossSpeed) === "oss") {
     log("Selected OSS mirror (clearly faster than GitHub here).");
     return { kind: "pinned", primaryUrl: ossFeedUrl(tag), fallbackUrl: githubFeedUrl(tag) };
