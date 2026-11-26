@@ -468,6 +468,7 @@ jobs:
   mirror-gitcode:
     name: Upload GitCode batch ${{ matrix.batch }} (one file at a time)
     needs: [plan-gitcode-mirror]
+    if: ${{ !cancelled() && needs.plan-gitcode-mirror.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
