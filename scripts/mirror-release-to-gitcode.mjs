@@ -5,10 +5,13 @@ import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-const [metadataFile, assetDir] = process.argv.slice(2);
+const [metadataFile, assetDir, mode, batchNumber] = process.argv.slice(2);
 const { GITCODE_REPO: repo, GITCODE_TOKEN: token } = process.env;
-const transferTimeout = 45 * 60_000;
-const uploadConcurrency = 4;
+const smallAssetLimit = 1024 * 1024;
+const largeUploadTimeout = 90 * 60_000;
+const smallUploadTimeout = 3 * 60_000;
+const verifyTimeout = 15 * 60_000;
+const largeAssetsPerBatch = 3;
 
 function require(condition, message) {
   if (!condition) throw new Error(message);
@@ -23,8 +26,8 @@ async function sha256(stream) {
 async function request(url, label, options = {}) {
   try {
     return await fetch(url, { signal: AbortSignal.timeout(30_000), ...options });
-  } catch {
-    throw new Error(`${label} failed or timed out`);
+  } catch (error) {
+    throw new Error(`${label} failed (${error.cause?.code ?? error.name})`);
   }
 }
 
@@ -100,10 +103,10 @@ function attachments(release) {
   );
 }
 
-async function publicDigest(tag, name) {
+async function publicDigest(tag, name, timeout = verifyTimeout) {
   const url = `https://gitcode.com/${repo}/releases/download/${tag}/${encodeURIComponent(name)}`;
   const response = await request(url, `Anonymous download of ${name}`, {
-    signal: AbortSignal.timeout(transferTimeout),
+    signal: AbortSignal.timeout(timeout),
   });
   require(response.ok &&
     response.body, `Anonymous download of ${name} returned HTTP ${response.status}`);
@@ -127,12 +130,25 @@ async function upload(tag, name, file) {
   require(destination.protocol === "https:" &&
     !destination.username &&
     !destination.password, `Invalid GitCode upload destination for ${name}`);
+  const timeout = file.size <= smallAssetLimit ? smallUploadTimeout : largeUploadTimeout;
+  let bytesRead = 0;
+  let lastReported = 0;
+  async function* streamFile() {
+    for await (const chunk of createReadStream(file.file)) {
+      yield chunk;
+      bytesRead += chunk.length;
+      if (bytesRead - lastReported >= 32 * 1024 * 1024) {
+        lastReported = bytesRead;
+        console.log(`Read for upload: ${name} ${bytesRead}/${file.size} bytes`);
+      }
+    }
+  }
   const response = await request(destination, `Upload of ${name}`, {
     method: "PUT",
     redirect: "error",
-    signal: AbortSignal.timeout(transferTimeout),
+    signal: AbortSignal.timeout(timeout),
     headers: { ...headers, "Content-Length": String(file.size) },
-    body: createReadStream(file.file),
+    body: streamFile(),
     duplex: "half",
   });
   require(response.ok, `Upload of ${name} returned HTTP ${response.status}`);
@@ -140,21 +156,70 @@ async function upload(tag, name, file) {
   console.log(`Uploaded ${name} in ${Math.ceil((Date.now() - started) / 1000)} seconds`);
 }
 
+function batchAssets(assets, number) {
+  require(Number.isInteger(number) && number >= 0, "Expected a non-negative batch number");
+  if (number === 0) return assets.filter(({ size }) => size <= smallAssetLimit);
+  const large = assets
+    .filter(({ size }) => size > smallAssetLimit)
+    .toSorted((a, b) => b.size - a.size);
+  return large.slice((number - 1) * largeAssetsPerBatch, number * largeAssetsPerBatch);
+}
+
+async function verifyRelease(release, releasePath) {
+  const current = attachments(await api(releasePath));
+  const missing = release.assets.filter(({ name }) => !current.has(name));
+  console.log(
+    `GitCode has ${release.assets.length - missing.length} of ${release.assets.length} GitHub attachments`,
+  );
+  for (const { name, size, digest: hash } of release.assets) {
+    if (!current.has(name)) continue;
+    require(hash, `GitHub has no SHA-256 digest for ${name}`);
+    await verifyAsset(release.tagName, name, { size, hash }, current.get(name));
+  }
+  require(!missing.length, `Missing attachments: ${missing.map(({ name }) => name).join(", ")}`);
+  const { name, digest, size } = release.assets.reduce((largest, asset) =>
+    asset.size > largest.size ? asset : largest,
+  );
+  require((await publicDigest(release.tagName, name, largeUploadTimeout)) ===
+    digest, `Anonymous SHA-256 mismatch for ${name}`);
+  console.log(
+    `Verified ${release.assets.length} GitCode attachments and anonymous download of ${name} (${size} bytes)`,
+  );
+}
+
 async function run() {
-  require(metadataFile && assetDir, "Usage: mirror-release-to-gitcode.mjs <release.json> <assets>");
-  require(/^[A-Za-z0-9_-]+\/penguin-harness-release-test$/.test(
-    repo ?? "",
-  ), "Set GITCODE_REPO to the personal test repository");
-  require(token, "Set GITCODE_TOKEN in the GitHub gitcode-release-test environment");
+  require(metadataFile &&
+    assetDir &&
+    mode, "Expected a release manifest, asset directory and mode");
   const release = JSON.parse(await readFile(metadataFile, "utf8"));
   const tag = release.tagName;
   require(/^v[0-9]+\.[0-9]+\.[0-9]+-gitcode-test\.[0-9]{8}\.[0-9]+$/.test(tag) &&
     release.isPrerelease &&
     !release.isDraft, "Only published test prereleases can be mirrored by this rehearsal");
-
-  const files = await inspectAssets(release.assets);
-  const commit = ensureTag(tag);
+  require(Array.isArray(release.assets) &&
+    release.assets.length > 0, "GitHub Release must include assets");
+  if (mode === "plan") {
+    const groups = Math.ceil(
+      release.assets.filter(({ size }) => size > smallAssetLimit).length / largeAssetsPerBatch,
+    );
+    console.log(JSON.stringify(Array.from({ length: groups + 1 }, (_, batch) => batch)));
+    return;
+  }
+  if (mode === "list") {
+    for (const { name } of batchAssets(release.assets, Number(batchNumber))) console.log(name);
+    return;
+  }
+  require(/^[A-Za-z0-9_-]+\/penguin-harness-release-test$/.test(
+    repo ?? "",
+  ), "Set GITCODE_REPO to the personal test repository");
+  require(token, "Set GITCODE_TOKEN in the GitHub gitcode-release-test environment");
   const releasePath = `/releases/tags/${tag}`;
+  if (mode === "verify") return verifyRelease(release, releasePath);
+  require(mode === "upload", "Unknown mirror mode");
+  const selected = batchAssets(release.assets, Number(batchNumber));
+  if (!selected.length) return;
+  const files = await inspectAssets(selected);
+  const commit = ensureTag(tag);
   const existing =
     (await api(releasePath, "GET", undefined, true)) ??
     (await api("/releases", "POST", {
@@ -168,44 +233,35 @@ async function run() {
     existing.prerelease === true, "Expected a GitCode test prerelease");
 
   const uploaded = attachments(existing);
-  const missing = [];
-  for (const entry of files) {
-    const [name, file] = entry;
-    if (!uploaded.has(name)) {
-      missing.push(entry);
+  const attempted = new Map();
+  for (const [name, file] of files) {
+    if (uploaded.has(name)) {
+      await verifyAsset(tag, name, file, uploaded.get(name));
+      console.log(`Already verified: ${name}`);
       continue;
     }
-    await verifyAsset(tag, name, file, uploaded.get(name));
-    console.log(`Already verified: ${name}`);
+    attempted.set(name, file);
+    try {
+      await upload(tag, name, file);
+    } catch (error) {
+      console.error(error.message);
+    }
   }
-  missing.sort((a, b) => b[1].size - a[1].size);
-  // Confirm the upload path on a small attachment before starting the large transfers.
-  const smallest = missing.pop();
-  if (smallest) await upload(tag, ...smallest);
-  const workers = Array.from({ length: Math.min(uploadConcurrency, missing.length) }, async () => {
-    while (missing.length > 0) await upload(tag, ...missing.shift());
-  });
-  const outcomes = await Promise.allSettled(workers);
-  const failures = outcomes.filter((result) => result.status === "rejected");
-  require(failures.length === 0, failures.map(({ reason }) => reason.message).join("; "));
+  if (!attempted.size) return;
 
   for (let attempt = 0; attempt < 10; attempt++) {
     const current = attachments(await api(releasePath));
-    if ([...files.keys()].every((name) => current.has(name))) {
-      for (const [name, file] of files) await verifyAsset(tag, name, file, current.get(name));
-      const [name, file] = [...files.entries()].reduce((largest, entry) =>
-        entry[1].size > largest[1].size ? entry : largest,
-      );
-      require((await publicDigest(tag, name)) ===
-        file.hash, `Anonymous SHA-256 mismatch for ${name}`);
-      console.log(
-        `Verified ${files.size} GitCode attachments and anonymous download of ${name} (${file.size} bytes)`,
-      );
-      return;
+    for (const [name, file] of attempted) {
+      if (!current.has(name)) continue;
+      await verifyAsset(tag, name, file, current.get(name));
+      attempted.delete(name);
     }
+    if (!attempted.size) return;
     if (attempt < 9) await delay(3000);
   }
-  throw new Error("GitCode did not list all uploaded attachments after waiting for registration");
+  throw new Error(
+    `GitCode still lacks these batch attachments: ${[...attempted.keys()].join(", ")}`,
+  );
 }
 
 run().catch((error) => {

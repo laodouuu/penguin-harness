@@ -433,15 +433,48 @@ jobs:
             install.sh
             install.ps1
 
-  mirror-gitcode:
-    name: Mirror GitHub prerelease to GitCode
+  plan-gitcode-mirror:
+    name: Plan GitCode mirror batches
     needs: [check-release, release]
     if: >-
       ${{ !cancelled() && inputs.sync_gitcode && needs.check-release.result == 'success' &&
           (needs.release.result == 'success' ||
            (needs.release.result == 'skipped' && needs.check-release.outputs.exists == 'true')) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    permissions:
+      contents: read
+    outputs:
+      batches: ${{ steps.plan.outputs.batches }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Partition the release without exceeding runner limits
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$PENGUIN_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets > release.json
+          batches="$(node scripts/mirror-release-to-gitcode.mjs release.json release-assets plan)"
+          echo "batches=$batches" >> "$GITHUB_OUTPUT"
+
+  mirror-gitcode:
+    name: Upload GitCode batch ${{ matrix.batch }} (one file at a time)
+    needs: [plan-gitcode-mirror]
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        batch: ${{ fromJSON(needs.plan-gitcode-mirror.outputs.batches) }}
     concurrency:
       group: gitcode-release-test
       cancel-in-progress: false
@@ -462,13 +495,50 @@ jobs:
       - name: Download exact GitHub Release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          BATCH: ${{ matrix.batch }}
         run: |
           gh release view "$PENGUIN_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json tagName,name,body,isDraft,isPrerelease,assets > release.json
-          gh release download "$PENGUIN_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-assets
+          node scripts/mirror-release-to-gitcode.mjs release.json release-assets list "$BATCH" > assets.txt
+          options=()
+          while IFS= read -r file; do options+=(--pattern "$file"); done < assets.txt
+          if (( ${#options[@]} )); then
+            gh release download "$PENGUIN_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --dir release-assets "${options[@]}"
+          fi
 
       - name: Upload and verify GitCode Release assets
         env:
+          BATCH: ${{ matrix.batch }}
           GITCODE_REPO: ${{ vars.GITCODE_REPO }}
           GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
-        run: node scripts/mirror-release-to-gitcode.mjs release.json release-assets
+        run: node scripts/mirror-release-to-gitcode.mjs release.json release-assets upload "$BATCH"
+
+  verify-gitcode-mirror:
+    name: Verify all GitCode Release attachments
+    needs: [mirror-gitcode]
+    if: ${{ !cancelled() && needs.mirror-gitcode.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    permissions:
+      contents: read
+    environment: gitcode-release-test
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Compare the attachment set and public download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITCODE_REPO: ${{ vars.GITCODE_REPO }}
+          GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+        run: |
+          gh release view "$PENGUIN_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets > release.json
+          node scripts/mirror-release-to-gitcode.mjs release.json release-assets verify
