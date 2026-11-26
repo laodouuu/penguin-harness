@@ -7,7 +7,8 @@ import { setTimeout as delay } from "node:timers/promises";
 
 const [metadataFile, assetDir] = process.argv.slice(2);
 const { GITCODE_REPO: repo, GITCODE_TOKEN: token } = process.env;
-const transferTimeout = 30 * 60_000;
+const transferTimeout = 45 * 60_000;
+const uploadConcurrency = 4;
 
 function require(condition, message) {
   if (!condition) throw new Error(message);
@@ -117,6 +118,8 @@ async function verifyAsset(tag, name, file, asset) {
 }
 
 async function upload(tag, name, file) {
+  const started = Date.now();
+  console.log(`Uploading ${name} (${file.size} bytes)`);
   const { url, headers } = await api(
     `/releases/${tag}/upload_url?file_name=${encodeURIComponent(name)}`,
   );
@@ -134,6 +137,7 @@ async function upload(tag, name, file) {
   });
   require(response.ok, `Upload of ${name} returned HTTP ${response.status}`);
   await response.body?.cancel();
+  console.log(`Uploaded ${name} in ${Math.ceil((Date.now() - started) / 1000)} seconds`);
 }
 
 async function run() {
@@ -164,15 +168,26 @@ async function run() {
     existing.prerelease === true, "Expected a GitCode test prerelease");
 
   const uploaded = attachments(existing);
-  for (const [name, file] of files) {
-    if (uploaded.has(name)) {
-      await verifyAsset(tag, name, file, uploaded.get(name));
-      console.log(`Already verified: ${name}`);
-    } else {
-      await upload(tag, name, file);
-      console.log(`Uploaded: ${name}`);
+  const missing = [];
+  for (const entry of files) {
+    const [name, file] = entry;
+    if (!uploaded.has(name)) {
+      missing.push(entry);
+      continue;
     }
+    await verifyAsset(tag, name, file, uploaded.get(name));
+    console.log(`Already verified: ${name}`);
   }
+  missing.sort((a, b) => b[1].size - a[1].size);
+  // Confirm the upload path on a small attachment before starting the large transfers.
+  const smallest = missing.pop();
+  if (smallest) await upload(tag, ...smallest);
+  const workers = Array.from({ length: Math.min(uploadConcurrency, missing.length) }, async () => {
+    while (missing.length > 0) await upload(tag, ...missing.shift());
+  });
+  const outcomes = await Promise.allSettled(workers);
+  const failures = outcomes.filter((result) => result.status === "rejected");
+  require(failures.length === 0, failures.map(({ reason }) => reason.message).join("; "));
 
   for (let attempt = 0; attempt < 10; attempt++) {
     const current = attachments(await api(releasePath));
